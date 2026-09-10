@@ -1,6 +1,6 @@
 # 2D SPH Fluid Simulation
 
-A Unity-based Smoothed Particle Hydrodynamics (SPH) fluid simulation built as a step-by-step learning project. The goal is to progress from "I don't know what SPH is" to a working GPU-accelerated fluid simulator, with each phase building on the last.
+A Unity-based Smoothed Particle Hydrodynamics (SPH) fluid simulation built as a step-by-step learning project. **Start in 2D. Master 2D completely. Then convert to 3D.** The 2D and 3D implementations are treated as separate milestones to keep the learning curve manageable.
 
 ## Who this is for
 
@@ -37,15 +37,24 @@ This project implements **Weakly Compressible SPH (WCSPH)**. The core ideas:
 
 ## Architecture Plan
 
-The simulation is developed in phases. Each phase has two parts: **study the theory**, then **implement the code**.
+The simulation is developed in strict phases. **Master 2D completely before touching 3D.** The 2D and 3D implementations are separate milestones, not incremental steps.
+
+### 2D Path (Phases 1–4)
+
+Each phase has two parts: **study the theory**, then **implement the code**.
 
 1. **Foundation** — Unity setup, math prerequisites, debugging tools
 2. **First SPH** — brute-force CPU solver with all core forces
-3. **Validation** — benchmark scenarios and visual debugging
-4. **CPU Optimization** — spatial hashing, Burst, Jobs
-5. **GPU Acceleration** — compute shaders (Metal-compatible)
-6. **Rendering** — make it look like fluid, not just dots
-7. **Extension** — 3D, interaction, polish
+3. **CPU Optimization** — spatial hashing, Burst, Jobs
+4. **GPU Acceleration** — compute shaders (Metal-compatible on macOS)
+5. **Rendering** — make it look like fluid, not just dots
+
+### 3D Path (Phase 5+)
+
+**Only start after 2D is fully working.**
+
+6. **3D Conversion** — extend data structures, kernels, and rendering to 3D
+7. **Polish** — interaction, UI, benchmarks
 
 Key technical targets:
 
@@ -53,6 +62,8 @@ Key technical targets:
 - **Structure of Arrays (SoA)** memory layout for cache efficiency
 - **Spatial hashing** for O(N) neighbor search
 - **Zero CPU readback** during simulation — all physics on GPU
+
+> **Important:** The 2D solver and 3D solver are separate implementations. Do not mix 2D and 3D code during development. Finish 2D validation first, then port to 3D.
 
 ## Tech Stack
 
@@ -63,4 +74,4 @@ Key technical targets:
 
 ## Status
 
-Active learning project. See `TASKS.md` for the private development roadmap.
+Active learning project. Currently working on the **2D path**. 3D conversion begins only after 2D is validated. See `TASKS.md` for the private development roadmap.
