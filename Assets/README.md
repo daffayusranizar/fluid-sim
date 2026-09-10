@@ -1,6 +1,12 @@
 # 2D SPH Fluid Simulation
 
-A Unity-based Smoothed Particle Hydrodynamics (SPH) fluid simulation built as a learning project. The goal is to progress from a basic CPU particle prototype to a full GPU-accelerated 3D fluid engine with volumetric rendering.
+A Unity-based Smoothed Particle Hydrodynamics (SPH) fluid simulation built as a step-by-step learning project. The goal is to progress from "I don't know what SPH is" to a working GPU-accelerated fluid simulator, with each phase building on the last.
+
+## Who this is for
+
+- **Platform:** macOS (no NVIDIA-specific tooling)
+- **Experience:** Basic C#/C++ syntax familiarity, beginner Unity user, no prior fluid simulation experience
+- **Goal:** Deep understanding through implementation, not just following a tutorial
 
 ## Current State
 
@@ -31,26 +37,28 @@ This project implements **Weakly Compressible SPH (WCSPH)**. The core ideas:
 
 ## Architecture Plan
 
-The simulation is being developed in phases:
+The simulation is developed in phases. Each phase has two parts: **study the theory**, then **implement the code**.
 
-1. **CPU prototype** — correctness and benchmarking
-2. **Burst / Job System** — parallel CPU performance
-3. **Compute shaders** — GPU SPH evaluation
-4. **Spatial hashing** — \\(O(N)\\) neighbor search
-5. **3D extension** — full volumetric simulation
-6. **Rendering** — surface and volumetric output
+1. **Foundation** — Unity setup, math prerequisites, debugging tools
+2. **First SPH** — brute-force CPU solver with all core forces
+3. **Validation** — benchmark scenarios and visual debugging
+4. **CPU Optimization** — spatial hashing, Burst, Jobs
+5. **GPU Acceleration** — compute shaders (Metal-compatible)
+6. **Rendering** — make it look like fluid, not just dots
+7. **Extension** — 3D, interaction, polish
 
 Key technical targets:
 
-- **GPU spatial hashing** with count sort + Blelloch prefix scan for \\(O(N)\\) neighbor queries
-- **Structure of Arrays (SoA)** memory layout for GPU cache efficiency
-- **Zero CPU readback** during simulation — all physics remain on VRAM
+- **GPU compute shaders** via Unity's platform-agnostic pipeline (works on macOS Metal)
+- **Structure of Arrays (SoA)** memory layout for cache efficiency
+- **Spatial hashing** for O(N) neighbor search
+- **Zero CPU readback** during simulation — all physics on GPU
 
 ## Tech Stack
 
 - Unity 6 / URP
 - C# + Burst Compiler
-- HLSL Compute Shaders
+- HLSL Compute Shaders (Metal backend on macOS)
 - C# Job System
 
 ## Status
