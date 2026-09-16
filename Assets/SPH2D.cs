@@ -24,6 +24,10 @@ public class SPH2D : MonoBehaviour
     public float smoothingLength = 1f;
     public int debugParticle = 0;
 
+    [Header("Density")]
+    public float restDensity = 1000f;
+    public float particleMass = 0.1f;
+
     private Particle2D[] particles;
     private List<int>[] neighbors;
 
@@ -72,13 +76,20 @@ public class SPH2D : MonoBehaviour
         // float halfY = boxSize.y * 0.5f;
 
         FindNeighbors();
+        ComputeDensity();
 
         for (int i = 0; i < particles.Length; i++)
         {
             
         }
 
-        // debug print
+        // DEBUG: log density per particle so you can verify density computation
+       for (int i = 0; i < particles.Length; i++)
+       {
+           Debug.Log($"Particle {i}: density={particles[i].density:F2}");
+       }
+
+       // debug print
 
     }
 
@@ -110,7 +121,29 @@ public class SPH2D : MonoBehaviour
        {                                                                         
            Debug.Log($"Particle {i}: {neighbors[i].Count} neighbors");           
        }                                                                         
-    }                                                                              
+    }    
+
+    private void ComputeDensity()                                                               
+   {                                                                                           
+       for (int i = 0; i < particles.Length; i++)                                              
+       {                                                                                       
+           float density = 0f;                                                                 
+                                                                                               
+           for (int j = 0; j < neighbors[i].Count; j++)                                        
+           {                                                                                   
+               int neighborIndex = neighbors[i][j];                                            
+               float r = Vector2.Distance(particles[i].position, particles[neighborIndex].position);                                                           
+                                                                                               
+               if (r < smoothingLength && r > 0f)                                              
+               {                                                                               
+                   float diff = smoothingLength * smoothingLength - r * r;                     
+                   density += particleMass * (4f / (Mathf.PI * Mathf.Pow(smoothingLength, 8f))) * Mathf.Pow(diff, 3f);                                                                  
+               }                                                                               
+           }                                                                                   
+                                                                                               
+           particles[i].density = density;                                                     
+       }                                                                                       
+   }                                                                           
                                                                                    
     private void OnDrawGizmos()
     {
@@ -121,11 +154,13 @@ public class SPH2D : MonoBehaviour
        Gizmos.color = Color.blue;                                                
        Gizmos.DrawWireCube(transform.position, new Vector3(boxSize.x, boxSize.y, 0f));                                                                           
                                                                                  
-       // 2. Draw particles                                                      
-       Gizmos.color = Color.yellow;                                               
-       foreach (var p in particles)                                               
-       {                                                                          
-           Gizmos.DrawWireSphere(new Vector3(p.position.x, p.position.y, 0f),0.08f);                                                                         
+       // 2. Draw particles colored by density
+       // Low density = blue, high density = red
+       for (int i = 0; i < particles.Length; i++)
+       {
+           float t = Mathf.InverseLerp(0f, restDensity * 1.5f, particles[i].density);
+           Gizmos.color = Color.Lerp(Color.blue, Color.red, t);
+           Gizmos.DrawWireSphere(new Vector3(particles[i].position.x, particles[i].position.y, 0f), 0.08f);
        }                                                                          
                                                                                   
        // DEBUG: draw only one debug particle and its neighbors
