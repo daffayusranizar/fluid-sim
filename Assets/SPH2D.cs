@@ -32,8 +32,24 @@ public class SPH2D : MonoBehaviour
     public float stiffness = 2000f;
     public bool showPressureColor = true;
 
+    [Header("Spawn")]
+    public bool useRandomSpawn = true;
+
+    [Header("Pressure Heat Map")]
+    public bool showPressureHeatMap = true;
+    public int heatMapResolution = 64;
+    [Range(1f, 3f)] public float heatMapBlur = 1.5f;
+    [Range(0f, 1f)] public float heatMapOpacity = 0.6f;
+
     private Particle2D[] particles;
     private List<int>[] neighbors;
+
+    private Mesh heatMapMesh;
+    private Material heatMapMaterial;
+    private Vector3[] heatMapVerts;
+    private Color[] heatMapColors;
+    private int builtHeatMapResolution = -1;
+    private Vector2 builtBoxSize;
 
     public int TotalParticles => numToSpawn.x * numToSpawn.y;
 
@@ -45,6 +61,29 @@ public class SPH2D : MonoBehaviour
     private void SpawnParticles()
     {
         particles = new Particle2D[TotalParticles];
+
+        // Random scatter across the whole canvas
+        if (useRandomSpawn)
+        {
+            Vector2 center = transform.position;
+
+            for (int i = 0; i < TotalParticles; i++)
+            {
+                Vector2 position = center + new Vector2(
+                    Random.Range(-boxSize.x * 0.5f, boxSize.x * 0.5f),
+                    Random.Range(-boxSize.y * 0.5f, boxSize.y * 0.5f)
+                );
+
+                particles[i] = new Particle2D
+                {
+                    position = position,
+                    velocity = Vector2.zero,
+                    density = 0f,
+                    pressure = 0f
+                };
+            }
+            return;
+        }
 
         int index = 0;
 
@@ -158,6 +197,173 @@ public class SPH2D : MonoBehaviour
             particles[i].pressure = stiffness * (particles[i].density - restDensity);
         }
     }
+
+    private int HeatMapResolutionClamped => Mathf.Clamp(heatMapResolution, 2, 512);
+
+    // Builds a quad-grid mesh covering the container. Vertex colors are written
+    // each frame; the GPU interpolates between them, which gives a smooth field.
+    private void RebuildHeatMapMesh()
+    {
+        int res = HeatMapResolutionClamped;
+        int side = res + 1;
+
+        heatMapVerts = new Vector3[side * side];
+        heatMapColors = new Color[side * side];
+        int[] tris = new int[res * res * 6];
+
+        float cellW = boxSize.x / res;
+        float cellH = boxSize.y / res;
+
+        for (int y = 0; y < side; y++)
+        {
+            for (int x = 0; x < side; x++)
+            {
+                int idx = y * side + x;
+                heatMapVerts[idx] = new Vector3(
+                    -boxSize.x * 0.5f + x * cellW,
+                    -boxSize.y * 0.5f + y * cellH,
+                    0f);
+            }
+        }
+
+        int t = 0;
+        for (int y = 0; y < res; y++)
+        {
+            for (int x = 0; x < res; x++)
+            {
+                int i0 = y * side + x;
+                int i1 = i0 + 1;
+                int i2 = i0 + side;
+                int i3 = i2 + 1;
+
+                tris[t++] = i0; tris[t++] = i2; tris[t++] = i1;
+                tris[t++] = i1; tris[t++] = i2; tris[t++] = i3;
+            }
+        }
+
+        if (heatMapMesh == null)
+        {
+            heatMapMesh = new Mesh { hideFlags = HideFlags.HideAndDontSave };
+        }
+
+        heatMapMesh.Clear();
+
+        // A 16-bit index buffer caps a mesh at 65,535 vertices. Resolutions above
+        // ~255 cells per side exceed that, so switch to 32-bit indices.
+        heatMapMesh.indexFormat = heatMapVerts.Length > 65535
+            ? UnityEngine.Rendering.IndexFormat.UInt32
+            : UnityEngine.Rendering.IndexFormat.UInt16;
+
+        heatMapMesh.vertices = heatMapVerts;
+        heatMapMesh.colors = heatMapColors;
+        heatMapMesh.triangles = tris;
+
+        builtHeatMapResolution = res;
+        builtBoxSize = boxSize;
+    }
+
+    // Samples the pressure field at every mesh vertex and writes the vertex colors:
+    // blue = below rest density, white = at rest density, red = above rest density
+    private void UpdateHeatMapColors()
+    {
+        // Sample with a wider kernel than the physics kernel to smooth the field
+        float sampleH = smoothingLength * heatMapBlur;
+        float h2 = sampleH * sampleH;
+        float poly6Const = 4f / (Mathf.PI * Mathf.Pow(sampleH, 8f));
+        Vector2 center = transform.position;
+
+        // Auto-range so the heat map always shows contrast
+        float maxAbs = 1f;
+        for (int i = 0; i < particles.Length; i++)
+        {
+            float absP = Mathf.Abs(particles[i].pressure);
+            if (absP > maxAbs) maxAbs = absP;
+        }
+
+        for (int v = 0; v < heatMapVerts.Length; v++)
+        {
+            Vector2 sample = center + new Vector2(heatMapVerts[v].x, heatMapVerts[v].y);
+
+            float weightedPressure = 0f;
+            float weightSum = 0f;
+
+            for (int i = 0; i < particles.Length; i++)
+            {
+                float r2 = (particles[i].position - sample).sqrMagnitude;
+                if (r2 < h2)
+                {
+                    float diff = h2 - r2;
+                    float w = poly6Const * diff * diff * diff;
+                    weightedPressure += particles[i].pressure * w;
+                    weightSum += w;
+                }
+            }
+
+            // No particles nearby: leave vertex fully transparent
+            if (weightSum <= 0f)
+            {
+                heatMapColors[v] = new Color(0f, 0f, 0f, 0f);
+                continue;
+            }
+
+            float p = weightedPressure / weightSum;
+            float t = Mathf.Clamp(p / maxAbs, -1f, 1f);
+
+            Color c = t < 0f
+                ? Color.Lerp(Color.white, Color.blue, -t)
+                : Color.Lerp(Color.white, Color.red, t);
+            c.a = heatMapOpacity;
+            heatMapColors[v] = c;
+        }
+
+        heatMapMesh.colors = heatMapColors;
+    }
+
+    private void DrawHeatMapMesh()
+    {
+        if (heatMapMaterial == null)
+        {
+            Shader shader = Shader.Find("Hidden/Internal-Colored");
+            if (shader == null) return;
+
+            heatMapMaterial = new Material(shader) { hideFlags = HideFlags.HideAndDontSave };
+            heatMapMaterial.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
+            heatMapMaterial.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
+            heatMapMaterial.SetInt("_Cull", (int)UnityEngine.Rendering.CullMode.Off);
+            heatMapMaterial.SetInt("_ZWrite", 0);
+        }
+
+        heatMapMaterial.SetPass(0);
+        Graphics.DrawMeshNow(heatMapMesh, transform.localToWorldMatrix);
+    }
+
+    private void DrawPressureHeatMap()
+    {
+        if (heatMapMesh == null ||
+            builtHeatMapResolution != HeatMapResolutionClamped ||
+            builtBoxSize != boxSize)
+        {
+            RebuildHeatMapMesh();
+        }
+
+        UpdateHeatMapColors();
+        DrawHeatMapMesh();
+    }
+
+    private void OnDestroy()
+    {
+        if (heatMapMesh != null)
+        {
+            if (Application.isPlaying) Destroy(heatMapMesh);
+            else DestroyImmediate(heatMapMesh);
+        }
+
+        if (heatMapMaterial != null)
+        {
+            if (Application.isPlaying) Destroy(heatMapMaterial);
+            else DestroyImmediate(heatMapMaterial);
+        }
+    }
                                                                                    
     private void OnDrawGizmos()
     {
@@ -167,6 +373,12 @@ public class SPH2D : MonoBehaviour
        // 1. Draw container                                                      
        Gizmos.color = Color.blue;                                                
        Gizmos.DrawWireCube(transform.position, new Vector3(boxSize.x, boxSize.y, 0f));                                                                           
+
+       // 1b. Pressure heat map across the whole canvas
+       if (showPressureHeatMap)
+       {
+           DrawPressureHeatMap();
+       }
                                                                                  
        // 2. Draw particles colored by density or pressure
        // Low value = blue, high value = red
