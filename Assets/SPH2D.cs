@@ -28,6 +28,10 @@ public class SPH2D : MonoBehaviour
     public float restDensity = 1000f;
     public float particleMass = 0.1f;
 
+    [Header("Pressure")]
+    public float stiffness = 2000f;
+    public bool showPressureColor = true;
+
     private Particle2D[] particles;
     private List<int>[] neighbors;
 
@@ -77,16 +81,17 @@ public class SPH2D : MonoBehaviour
 
         FindNeighbors();
         ComputeDensity();
+        ComputePressure();
 
         for (int i = 0; i < particles.Length; i++)
         {
             
         }
 
-        // DEBUG: log density per particle so you can verify density computation
+        // DEBUG: log pressure per particle so you can verify Tait EOS
        for (int i = 0; i < particles.Length; i++)
        {
-           Debug.Log($"Particle {i}: density={particles[i].density:F2}");
+           Debug.Log($"Particle {i}: density={particles[i].density:F2}, pressure={particles[i].pressure:F2}");
        }
 
        // debug print
@@ -144,6 +149,15 @@ public class SPH2D : MonoBehaviour
            particles[i].density = density;                                                     
        }                                                                                       
    }                                                                           
+
+    private void ComputePressure()
+    {
+        for (int i = 0; i < particles.Length; i++)
+        {
+            // Tait equation of state: p = k * (density - restDensity)
+            particles[i].pressure = stiffness * (particles[i].density - restDensity);
+        }
+    }
                                                                                    
     private void OnDrawGizmos()
     {
@@ -154,11 +168,13 @@ public class SPH2D : MonoBehaviour
        Gizmos.color = Color.blue;                                                
        Gizmos.DrawWireCube(transform.position, new Vector3(boxSize.x, boxSize.y, 0f));                                                                           
                                                                                  
-       // 2. Draw particles colored by density
-       // Low density = blue, high density = red
+       // 2. Draw particles colored by density or pressure
+       // Low value = blue, high value = red
        for (int i = 0; i < particles.Length; i++)
        {
-           float t = Mathf.InverseLerp(0f, restDensity * 1.5f, particles[i].density);
+           float value = showPressureColor ? particles[i].pressure : particles[i].density;
+           float maxValue = showPressureColor ? stiffness * (restDensity * 0.5f) : restDensity * 1.5f;
+           float t = Mathf.InverseLerp(0f, maxValue, value);
            Gizmos.color = Color.Lerp(Color.blue, Color.red, t);
            Gizmos.DrawWireSphere(new Vector3(particles[i].position.x, particles[i].position.y, 0f), 0.08f);
        }                                                                          
