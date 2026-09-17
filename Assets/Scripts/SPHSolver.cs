@@ -14,15 +14,23 @@ public struct SolverParams
     // --- Kernel geometry (derived from smoothingLength at spawn) ---
     public float smoothingLength;
     public float smoothingLengthSq;
-    public float poly6Const;
-    public float spikyConst;
-    public float viscConst;
+
+    public float poly6Const;            // viscosity weight
+
+    public float spikyPow2Const;        // main channel density
+    public float spikyPow2GradConst;    // main channel force
+
+    public float spikyPow3Const;        // near channel density
+    public float spikyPow3GradConst;    // near channel force
 
     // --- Density and pressure ---
     public float restDensity;
     public float particleMass;
     public float stiffness;
     public bool clampPressurePositive;
+
+    // --- Near pressure (double density relaxation) ---
+    public float nearPressureMultiplier;
 
     // --- Viscosity ---
     public float viscosity;
@@ -55,6 +63,12 @@ public static class SPHSolver
     /// boundary particles.
     /// </summary>
     /// <remarks>
+    /// Two density estimates are produced. The main one (SpikyPow2) drives the
+    /// Tait pressure and can fall below rest density, which is what gives a
+    /// two-way restoring force. The near one (SpikyPow3) drives an
+    /// always-repulsive short-range term that stops the fluid collapsing when
+    /// the main term pulls.
+    ///
     /// The boundary term is what makes wall behaviour work. Near a wall roughly
     /// half of a particle's kernel support lies inside the solid, so without it
     /// the density is badly under-estimated, pressure collapses to zero, and
@@ -67,21 +81,29 @@ public static class SPHSolver
         in NativeArray<float2> boundaryPositions,
         in SolverParams p)
     {
+        float h = p.smoothingLength;
+
         for (int i = 0; i < particles.Length; i++)
         {
             Particle2D particle = particles[i];
             float2 posI = particle.position;
             float density = 0f;
+            float nearDensity = 0f;
 
             int fluidStart = neighbors.fluidStart[i];
             int fluidEnd = neighbors.fluidStart[i + 1];
 
             for (int k = fluidStart; k < fluidEnd; k++)
             {
-                float r2 = math.distancesq(particles[neighbors.fluid[k]].position, posI);
-                density += p.particleMass * SPHMath.Poly6Kernel(r2, p.smoothingLengthSq, p.poly6Const);
+                float r = math.sqrt(math.distancesq(particles[neighbors.fluid[k]].position, posI));
+
+                density += p.particleMass * SPHMath.SpikyPow2Kernel(r, h, p.spikyPow2Const);
+                nearDensity += p.particleMass * SPHMath.SpikyPow3Kernel(r, h, p.spikyPow3Const);
             }
 
+            // Boundary particles contribute to the main density only. The near
+            // channel is about fluid particles crowded against each other; the
+            // wall is handled by the main channel plus the position clamp.
             if (p.useBoundaryParticles)
             {
                 int bStart = neighbors.boundaryStart[i];
@@ -89,13 +111,14 @@ public static class SPHSolver
 
                 for (int k = bStart; k < bEnd; k++)
                 {
-                    float r2 = math.distancesq(boundaryPositions[neighbors.boundary[k]], posI);
+                    float r = math.sqrt(math.distancesq(boundaryPositions[neighbors.boundary[k]], posI));
                     density += p.restDensity * p.boundaryVolume
-                               * SPHMath.Poly6Kernel(r2, p.smoothingLengthSq, p.poly6Const);
+                               * SPHMath.SpikyPow2Kernel(r, h, p.spikyPow2Const);
                 }
             }
 
             particle.density = density;
+            particle.nearDensity = nearDensity;
             particles[i] = particle;
         }
     }
@@ -110,6 +133,9 @@ public static class SPHSolver
 
             particle.pressure = SPHMath.Pressure(
                 particle.density, p.restDensity, p.stiffness, p.clampPressurePositive);
+
+            particle.nearPressure = SPHMath.NearPressure(
+                particle.nearDensity, p.nearPressureMultiplier);
 
             particles[i] = particle;
         }
@@ -132,9 +158,21 @@ public static class SPHSolver
     /// boundary push.
     /// </summary>
     /// <remarks>
-    /// Sign: f_i = -(p_i + p_j) * gradW, and gradW points from i toward j. With
-    /// positive pressure the force therefore points from j to i, i.e. away from
-    /// the neighbour. Repulsive, as it must be.
+    /// Every term carries particleMass, because density is mass-scaled and the
+    /// force has to be consistent with it. Without it the acceleration ends up
+    /// proportional to 1/mass instead of being mass-independent, which is a
+    /// large silent error the moment mass is not 1.
+    ///
+    /// Two channels are summed. The main channel uses the linear SpikyPow2
+    /// gradient and can be attractive when the Tait pressure is negative. The
+    /// near channel uses the quadratic SpikyPow3 gradient with a pressure that
+    /// is never negative, so it is always repulsive and dominates at short
+    /// range. Together they give a fluid that can hold itself together without
+    /// collapsing into pairs.
+    ///
+    /// Sign: gradW points from i toward j, so with positive pressure the force
+    /// must point from j to i, i.e. away from the neighbour. dir below is
+    /// already that direction, hence the positive sign.
     ///
     /// For boundary particles the coefficient collapses. Muller's term is
     /// m_b * (p_i + p_b) / (2 rho_b); with m_b = restDensity * V_b, pressure
@@ -175,17 +213,37 @@ public static class SPHSolver
                 float r = math.sqrt(r2);
                 float2 dir = rVec / r;
 
-                float contribution = p.particleMass
-                                     * (particle.pressure + other.pressure)
-                                     / (2f * other.density)
-                                     * SPHMath.SpikyGradientMagnitude(r, h, p.spikyConst);
+                // Main channel: symmetrised Tait pressure over the linear
+                // SpikyPow2 gradient. This one can be attractive.
+                float sharedPressure = (particle.pressure + other.pressure) * 0.5f;
 
-                force += dir * contribution;
+                force += dir * (p.particleMass
+                                * SPHMath.SpikyPow2GradientMagnitude(r, h, p.spikyPow2GradConst)
+                                * sharedPressure / other.density);
+
+                // Near channel: always repulsive, short range only. This is what
+                // keeps the fluid from collapsing when the main term goes negative.
+                if (other.nearDensity > 0.0001f)
+                {
+                    float sharedNearPressure = (particle.nearPressure + other.nearPressure) * 0.5f;
+
+                    force += dir * (p.particleMass
+                                    * SPHMath.SpikyPow3GradientMagnitude(r, h, p.spikyPow3GradConst)
+                                    * sharedNearPressure / other.nearDensity);
+                }
             }
 
             if (p.useBoundaryParticles)
             {
-                float pressure = particle.pressure;
+                // The wall may push but never pull. Pressure mirroring copies the
+                // fluid particle's own pressure, and once the main channel is
+                // allowed to go negative that value is often negative near a wall
+                // (where density is below rest). A mirrored negative pressure
+                // makes the boundary attractive: particles get sucked onto the
+                // surface, the position clamp snaps them back, and the velocity
+                // reflection throws them out. Clamping the boundary pressure is
+                // the standard remedy for an under-resolved boundary layer.
+                float pressure = math.max(0f, particle.pressure);
 
                 int bStart = neighbors.boundaryStart[i];
                 int bEnd = neighbors.boundaryStart[i + 1];
@@ -199,8 +257,9 @@ public static class SPHSolver
                     float r = math.sqrt(r2);
                     float2 dir = rVec / r;
 
+                    // Pressure mirroring collapses the coefficient to V_b * p_i.
                     force += dir * (p.boundaryVolume * pressure
-                                    * SPHMath.SpikyGradientMagnitude(r, h, p.spikyConst));
+                                    * SPHMath.SpikyPow2GradientMagnitude(r, h, p.spikyPow2GradConst));
                 }
             }
 
@@ -214,9 +273,15 @@ public static class SPHSolver
     /// neighbours'.
     /// </summary>
     /// <remarks>
-    /// This is the only dissipative term in the solver. Without it the fluid
-    /// sloshes forever no matter how correct the pressure force is, because
-    /// pressure is conservative.
+    /// XSPH, not Muller's Laplacian formulation. Poly6 is used as a weight on
+    /// the velocity difference, and because it is non-negative everywhere the
+    /// blend can only move a velocity toward its neighbours'. That removes the
+    /// hazard Muller's version has, where the Laplacian of a standard kernel can
+    /// go negative for close particles and start adding energy.
+    ///
+    /// This is still the only dissipative term in the solver. Without it the
+    /// fluid sloshes forever no matter how correct the pressure force is,
+    /// because pressure is conservative.
     ///
     /// The direction lives in (v_j - v_i), so there is no unit vector to get
     /// backwards. Writes the per-particle contribution to viscosityForces as
@@ -229,8 +294,6 @@ public static class SPHSolver
         in SolverParams p,
         NativeArray<float2> viscosityForces)
     {
-        float h = p.smoothingLength;
-
         for (int i = 0; i < particles.Length; i++)
         {
             Particle2D particle = particles[i];
@@ -246,15 +309,15 @@ public static class SPHSolver
                 int n = neighbors.fluid[k];
 
                 Particle2D other = particles[n];
-                if (other.density <= 0.0001f) continue;
 
-                float r = math.sqrt(math.distancesq(other.position, posI));
-
-                viscForce += p.viscosity
-                             * p.particleMass
-                             * (other.velocity - velI)
-                             / other.density
-                             * SPHMath.ViscosityLaplacianMagnitude(r, h, p.viscConst);
+                // XSPH: Poly6 is used as a weight on the velocity difference, not
+                // as a Laplacian. Being non-negative everywhere it can only pull
+                // this velocity toward its neighbours', so there is no sign to get
+                // wrong and no way for the term to add energy. It also needs no
+                // square root, since Poly6 is evaluated from squared distance.
+                float r2 = math.distancesq(other.position, posI);
+                viscForce += (other.velocity - velI)
+                             * SPHMath.Poly6Kernel(r2, p.smoothingLengthSq, p.poly6Const);
             }
 
             if (viscosityForces.IsCreated && i < viscosityForces.Length)
@@ -262,7 +325,7 @@ public static class SPHSolver
                 viscosityForces[i] = viscForce;
             }
 
-            particle.force += viscForce;
+            particle.force += viscForce * p.viscosity;
             particles[i] = particle;
         }
     }
@@ -368,6 +431,43 @@ public static class SPHSolver
             : float.MaxValue;
 
         return math.min(dtCfl, dtAcc);
+    }
+
+    /// <summary>
+    /// One pass reporting the numbers needed to tell a solver problem from a
+    /// setup problem: mean density (is the fluid expanding or compressing?),
+    /// peak speed (is anything running away?) and peak acceleration (are the
+    /// forces sane relative to gravity?).
+    /// </summary>
+    [BurstCompile]
+    public static void Diagnostics(
+        in NativeArray<Particle2D> particles,
+        in SolverParams p,
+        out float meanDensity,
+        out float maxSpeed,
+        out float maxAccel)
+    {
+        float sum = 0f;
+        meanDensity = 0f;
+        maxSpeed = 0f;
+        maxAccel = 0f;
+
+        for (int i = 0; i < particles.Length; i++)
+        {
+            Particle2D particle = particles[i];
+            sum += particle.density;
+
+            float speed = math.length(particle.velocity);
+            if (speed > maxSpeed) maxSpeed = speed;
+
+            if (particle.density > 0.0001f)
+            {
+                float accel = math.length(particle.force / particle.density + p.gravity);
+                if (accel > maxAccel) maxAccel = accel;
+            }
+        }
+
+        if (particles.Length > 0) meanDensity = sum / particles.Length;
     }
 
     /// <summary>Mean density over particles that have any density at all.</summary>

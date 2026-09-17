@@ -128,9 +128,13 @@ Phase 1 produced several behaviours that the later phases must preserve. Phases 
 |---|---|---|
 | **Boundary particles** complete the kernel support near walls and push back via pressure mirroring (`p_b = p_i`). This is what stops particles welding to walls. | `SpawnBoundaryParticles()`, `ComputeDensity()`, `ComputePressureForce()` | T-023 (grid must index them), T-026–T-028 (must be ported) |
 | **Viscosity** is the only dissipative term. Without it the fluid sloshes forever. | `ComputeViscosityForce()` | T-028 (must be ported to HLSL) |
-| **Pressure clamping** (`p = max(0, k(ρ−ρ₀))`) is deliberate. Unclamping reintroduces the tensile instability. | `ComputePressure()` | T-027 (must be ported into the EOS) |
+| **Pressure clamping and the near channel are mutually exclusive.** The near pressure has no rest-density offset, so it is a permanent outward push that only a *negative* main pressure can balance. Clamping forbids negative pressure, so both together mean the fluid expands without limit — which presents as particles flying apart, not as anything clamp-shaped. `SPH2D` now warns on this combination. | `WarnIfClampConflictsWithNearChannel()` | T-027 (both channels must be ported together) |
+| **Two pressure channels: main (SpikyPow2, linear gradient, can go negative) and near (SpikyPow3, quadratic gradient, never negative).** The gradients must differ in shape or the near channel cannot suppress short-range pairing. The fluid settles ~1% *below* `restDensity` by design. | `ComputeDensity()`, `ComputePressureForce()` | T-027, T-028 |
+| **Every force term carries `particleMass`.** Density is mass-scaled, so a force without it makes acceleration proportional to `1/mass` instead of mass-independent. This project's mass is ~240, so the error is large and silent. | `ComputePressureForce()`, `ComputeViscosityForce()` | T-028 (must carry through to HLSL) |
+| **Viscosity is XSPH, not Müller's Laplacian.** Poly6 is used as a non-negative weight, so the blend cannot add energy. | `ComputeViscosityForce()` | T-028 (must be ported) |
 | **Adaptive CFL step size** derived from `c_s = √stiffness`, max velocity and max acceleration. | `ComputeStableTimeStep()` | T-029 (conflicts with "zero CPU readback") |
-| **Auto-calibrated particle mass** so mean spawn density matches `restDensity`. | `CalibrateParticleMass()` | Any phase that changes spawn or resolution |
+| **Auto-calibrated particle mass** so mean spawn density matches `restDensity`. It measures whichever density kernel is in use, so it absorbs kernel changes automatically. | `CalibrateParticleMass()` | Any phase that changes spawn or resolution |
+| **Density uses SpikyPow2, not Poly6.** Poly6 was retired from density when the second pressure channel was added, and now serves as the viscosity weight instead. | `ComputeDensity()`, `SPHMath` | T-027 |
 | **Smoothing length derived from spacing** (`h = 2.2 × spacing`), not hand-set. | `SpawnParticles()` | Any phase that changes particle count |
 
 **Rule:** if a later task must change one of these, record the decision and the reason in that task. Do not let it change by omission.

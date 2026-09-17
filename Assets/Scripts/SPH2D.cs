@@ -15,7 +15,9 @@ public class SPH2D : MonoBehaviour
     public Vector2 boxSize = new Vector2(20f, 20f);
 
     [Header("Particles")]
-    public Vector2Int numToSpawn = new Vector2Int(20, 20);
+    [Tooltip("Total number of particles. Spawning is a blue-noise scatter, so " +
+             "there is no grid to describe and no x-by-y split.")]
+    public int particleCount = 400;
 
     [Header("Physics")]
     public Vector2 gravity = new Vector2(0f, -9.81f);
@@ -49,7 +51,17 @@ public class SPH2D : MonoBehaviour
 
     [Header("Pressure")]
     public float stiffness = 2000f;
-    public bool clampPressurePositive = true;
+
+    // Off by default: with the near-pressure channel present, short-range
+    // repulsion no longer depends on the main pressure being positive, so
+    // negative pressure is safe and gives the two-way restoring force that a
+    // real equilibrium needs. Turn this back on to compare.
+    public bool clampPressurePositive = false;
+
+    // Strength of the always-repulsive near channel. Scale dependent -- this
+    // value is a starting point, tune over an order of magnitude either way.
+    public float nearPressureMultiplier = 20f;
+
     public bool showPressureColor = true;
 
     [Header("Viscosity")]
@@ -64,11 +76,11 @@ public class SPH2D : MonoBehaviour
     public bool showViscosityArrows = false;
     public float forceArrowLength = 0.4f;
 
-    [Header("Pressure Heat Map")]
-    public bool showPressureHeatMap = true;
-    public int heatMapResolution = 64;
-    [Range(1f, 3f)] public float heatMapBlur = 1.5f;
-    [Range(0f, 1f)] public float heatMapOpacity = 0.6f;
+    [Tooltip("Draw particles as gizmo spheres in the Scene view. This is the " +
+             "fallback visualiser and stays on by default: turn it off once " +
+             "ParticleRenderer2D's instanced discs are confirmed working, since " +
+             "drawing both doubles the work.")]
+    public bool showParticleGizmos = true;
 
     // --- Native simulation state ---
     private NativeArray<Particle2D> particles;
@@ -83,6 +95,7 @@ public class SPH2D : MonoBehaviour
     private float spawnSpacing = 1f;
     private float timeAccumulator;
     private float lastStepSize;
+    private bool warnedAboutClampConflict;
 
     private readonly System.Diagnostics.Stopwatch solverTimer = new System.Diagnostics.Stopwatch();
     private double lastSolverMs;
@@ -95,20 +108,16 @@ public class SPH2D : MonoBehaviour
     private float2[] renderViscosityForces;
     private float2[] renderBoundary;
 
-    // --- Heat map (debug only, handled in managed space) ---
-    private Mesh heatMapMesh;
-    private Material heatMapMaterial;
-    private Vector3[] heatMapVerts;
-    private Color[] heatMapColors;
-    private int builtHeatMapResolution = -1;
-    private Vector2 builtBoxSize;
-
-    public int TotalParticles => numToSpawn.x * numToSpawn.y;
+    /// <summary>
+    /// Live particle state, exposed so the renderer can read it. Native and
+    /// read-only by convention: nothing outside the solver writes these.
+    /// </summary>
+    public NativeArray<Particle2D> Particles => particles;
 
     private void Awake()
     {
-        particles = new NativeArray<Particle2D>(TotalParticles, Allocator.Persistent);
-        viscosityForces = new NativeArray<float2>(TotalParticles, Allocator.Persistent);
+        particles = new NativeArray<Particle2D>(particleCount, Allocator.Persistent);
+        viscosityForces = new NativeArray<float2>(particleCount, Allocator.Persistent);
 
         SpawnParticles();
 
@@ -129,18 +138,6 @@ public class SPH2D : MonoBehaviour
         if (boundaryParticles.IsCreated) boundaryParticles.Dispose();
 
         grid.Dispose();
-
-        if (heatMapMesh != null)
-        {
-            if (Application.isPlaying) Destroy(heatMapMesh);
-            else DestroyImmediate(heatMapMesh);
-        }
-
-        if (heatMapMaterial != null)
-        {
-            if (Application.isPlaying) Destroy(heatMapMaterial);
-            else DestroyImmediate(heatMapMaterial);
-        }
     }
 
     /// <summary>
@@ -156,13 +153,17 @@ public class SPH2D : MonoBehaviour
             smoothingLength = h,
             smoothingLengthSq = h * h,
             poly6Const = SPHMath.Poly6Constant(h),
-            spikyConst = SPHMath.SpikyGradientConstant(h),
-            viscConst = SPHMath.ViscosityLaplacianConstant(h),
+
+            spikyPow2Const = SPHMath.SpikyPow2Constant(h),
+            spikyPow2GradConst = SPHMath.SpikyPow2GradientConstant(h),
+            spikyPow3Const = SPHMath.SpikyPow3Constant(h),
+            spikyPow3GradConst = SPHMath.SpikyPow3GradientConstant(h),
 
             restDensity = restDensity,
             particleMass = particleMass,
             stiffness = stiffness,
             clampPressurePositive = clampPressurePositive,
+            nearPressureMultiplier = nearPressureMultiplier,
 
             viscosity = viscosity,
 
@@ -174,6 +175,41 @@ public class SPH2D : MonoBehaviour
             boxHalfSize = new float2(boxSize.x * 0.5f, boxSize.y * 0.5f),
             collisionDamping = collisionDamping,
         };
+
+        WarnIfClampConflictsWithNearChannel();
+    }
+
+    /// <summary>
+    /// Clamping and the near channel cannot both be active.
+    /// </summary>
+    /// <remarks>
+    /// The near pressure has no rest-density offset, so for a packed fluid it is a
+    /// near-constant outward push that does not respond to compression. The only
+    /// thing that can hold it in is the main channel going negative. Clamping
+    /// makes negative pressure impossible, so the two together mean the fluid
+    /// expands without limit -- which reads as particles flying apart rather than
+    /// as anything obviously clamp-related.
+    ///
+    /// Warns once on entering the bad state rather than every frame.
+    /// </remarks>
+    private void WarnIfClampConflictsWithNearChannel()
+    {
+        bool conflict = clampPressurePositive && nearPressureMultiplier > 0f;
+
+        if (conflict && !warnedAboutClampConflict)
+        {
+            warnedAboutClampConflict = true;
+
+            Debug.LogWarning(
+                "clampPressurePositive is ON while nearPressureMultiplier > 0. The near " +
+                "channel is a permanent outward pressure and needs negative main pressure " +
+                "to balance it, so the fluid will expand without limit. Set " +
+                "clampPressurePositive = false, or set nearPressureMultiplier = 0.");
+        }
+        else if (!conflict)
+        {
+            warnedAboutClampConflict = false;
+        }
     }
 
     /// <summary>
@@ -204,7 +240,7 @@ public class SPH2D : MonoBehaviour
             spawnRegionCenter.y * maxOffset.y);
 
         float area = regionSize.x * regionSize.y;
-        float nominalSpacing = Mathf.Sqrt(area / Mathf.Max(1, TotalParticles));
+        float nominalSpacing = Mathf.Sqrt(area / Mathf.Max(1, particleCount));
         spawnSpacing = nominalSpacing;
 
         // Derive the smoothing length from the packing so the neighbour count is
@@ -215,7 +251,7 @@ public class SPH2D : MonoBehaviour
         float minDistSq = minDist * minDist;
         const int maxAttempts = 30;
 
-        for (int i = 0; i < TotalParticles; i++)
+        for (int i = 0; i < particleCount; i++)
         {
             float2 candidate = regionCenter;
 
@@ -416,8 +452,16 @@ public class SPH2D : MonoBehaviour
 
         if (debugLogs)
         {
-            Debug.Log($"steps={steps}, dt={lastStepSize:F5}, solver={lastSolverMs:F2}ms, " +
-                      $"h={smoothingLength:F3}, mass={particleMass:F2}, boundary={boundaryCount}");
+            SPHSolver.Diagnostics(particles, solverParams,
+                out float meanDensity, out float maxSpeed, out float maxAccel);
+
+            Debug.Log(
+                $"steps={steps}  dt={lastStepSize:F5}  solver={lastSolverMs:F1}ms\n" +
+                $"  setup : gravity=({gravity.x:F2},{gravity.y:F2})  h={smoothingLength:F3}  " +
+                $"mass={particleMass:F1}  boundary={boundaryCount}  " +
+                $"clamp={clampPressurePositive}  nearK={nearPressureMultiplier:F1}  visc={viscosity:F1}\n" +
+                $"  state : meanRho/restRho={meanDensity / Mathf.Max(1e-6f, restDensity):F4}  " +
+                $"maxSpeed={maxSpeed:F2}  maxAccel={maxAccel:F1}  (gravity={Mathf.Abs(gravity.y):F2})");
         }
     }
 
@@ -438,11 +482,9 @@ public class SPH2D : MonoBehaviour
     // Debug visualization
     // ------------------------------------------------------------------
 
-    private int HeatMapResolutionClamped => Mathf.Clamp(heatMapResolution, 2, 512);
-
     /// <summary>
-    /// Copies native state into managed arrays for the gizmo and heat map code.
-    /// Called once per frame from OnDrawGizmos, which is the only consumer.
+    /// Copies native state into managed arrays for the gizmo code. Called once
+    /// per frame from OnDrawGizmos, which is the only consumer.
     /// </summary>
     private void RefreshRenderSnapshot()
     {
@@ -485,14 +527,10 @@ public class SPH2D : MonoBehaviour
             }
         }
 
-        // 1b. Pressure heat map across the whole canvas
-        if (showPressureHeatMap)
-        {
-            DrawPressureHeatMap();
-        }
-
-        // 2. Draw particles colored by density or pressure
-        // Low value = blue, high value = red
+        // 2. Optional gizmo spheres, coloured by density or pressure.
+        // ParticleRenderer2D draws the instanced discs; this is the fallback
+        // visualiser, and running both at once doubles the work.
+        if (showParticleGizmos)
         for (int i = 0; i < renderParticles.Length; i++)
         {
             Particle2D particle = renderParticles[i];
@@ -595,166 +633,4 @@ public class SPH2D : MonoBehaviour
         }
     }
 
-    // ------------------------------------------------------------------
-    // Heat map: samples the pressure field into a vertex-coloured mesh
-    // ------------------------------------------------------------------
-
-    private void DrawPressureHeatMap()
-    {
-        if (heatMapMesh == null ||
-            builtHeatMapResolution != HeatMapResolutionClamped ||
-            builtBoxSize != boxSize)
-        {
-            RebuildHeatMapMesh();
-        }
-
-        UpdateHeatMapColors();
-        DrawHeatMapMesh();
-    }
-
-    /// <summary>
-    /// Builds a quad-grid mesh covering the container. Vertex colors are written
-    /// each frame; the GPU interpolates between them, which gives a smooth field.
-    /// </summary>
-    private void RebuildHeatMapMesh()
-    {
-        int res = HeatMapResolutionClamped;
-        int side = res + 1;
-
-        heatMapVerts = new Vector3[side * side];
-        heatMapColors = new Color[side * side];
-        int[] tris = new int[res * res * 6];
-
-        float cellW = boxSize.x / res;
-        float cellH = boxSize.y / res;
-
-        for (int y = 0; y < side; y++)
-        {
-            for (int x = 0; x < side; x++)
-            {
-                int idx = y * side + x;
-                heatMapVerts[idx] = new Vector3(
-                    -boxSize.x * 0.5f + x * cellW,
-                    -boxSize.y * 0.5f + y * cellH,
-                    0f);
-            }
-        }
-
-        int t = 0;
-        for (int y = 0; y < res; y++)
-        {
-            for (int x = 0; x < res; x++)
-            {
-                int i0 = y * side + x;
-                int i1 = i0 + 1;
-                int i2 = i0 + side;
-                int i3 = i2 + 1;
-
-                tris[t++] = i0; tris[t++] = i2; tris[t++] = i1;
-                tris[t++] = i1; tris[t++] = i2; tris[t++] = i3;
-            }
-        }
-
-        if (heatMapMesh == null)
-        {
-            heatMapMesh = new Mesh { hideFlags = HideFlags.HideAndDontSave };
-        }
-
-        heatMapMesh.Clear();
-
-        // A 16-bit index buffer caps a mesh at 65,535 vertices. Resolutions above
-        // ~255 cells per side exceed that, so switch to 32-bit indices.
-        heatMapMesh.indexFormat = heatMapVerts.Length > 65535
-            ? UnityEngine.Rendering.IndexFormat.UInt32
-            : UnityEngine.Rendering.IndexFormat.UInt16;
-
-        heatMapMesh.vertices = heatMapVerts;
-        heatMapMesh.colors = heatMapColors;
-        heatMapMesh.triangles = tris;
-
-        builtHeatMapResolution = res;
-        builtBoxSize = boxSize;
-    }
-
-    /// <summary>
-    /// Samples the pressure field at every mesh vertex and writes the vertex colors:
-    /// blue = below rest density, white = at rest density, red = above rest density
-    /// </summary>
-    private void UpdateHeatMapColors()
-    {
-        // Sample with a wider kernel than the physics kernel to smooth the field
-        float sampleH = smoothingLength * heatMapBlur;
-        float h2 = sampleH * sampleH;
-        float poly6Const = 4f / (Mathf.PI * Mathf.Pow(sampleH, 8f));
-        Vector2 center = transform.position;
-
-        // Auto-range so the heat map always shows contrast
-        float maxAbs = 1f;
-
-        for (int i = 0; i < renderParticles.Length; i++)
-        {
-            float absP = Mathf.Abs(renderParticles[i].pressure);
-            if (absP > maxAbs) maxAbs = absP;
-        }
-
-        for (int v = 0; v < heatMapVerts.Length; v++)
-        {
-            float2 sample = new float2(
-                center.x + heatMapVerts[v].x,
-                center.y + heatMapVerts[v].y);
-
-            float weightedPressure = 0f;
-            float weightSum = 0f;
-
-            for (int i = 0; i < renderParticles.Length; i++)
-            {
-                float r2 = math.distancesq(renderParticles[i].position, sample);
-
-                if (r2 < h2)
-                {
-                    float diff = h2 - r2;
-                    float w = poly6Const * diff * diff * diff;
-                    weightedPressure += renderParticles[i].pressure * w;
-                    weightSum += w;
-                }
-            }
-
-            // No particles nearby: leave vertex fully transparent
-            if (weightSum <= 0f)
-            {
-                heatMapColors[v] = new Color(0f, 0f, 0f, 0f);
-                continue;
-            }
-
-            float p = weightedPressure / weightSum;
-            float t = Mathf.Clamp(p / maxAbs, -1f, 1f);
-
-            Color c = t < 0f
-                ? Color.Lerp(Color.white, Color.blue, -t)
-                : Color.Lerp(Color.white, Color.red, t);
-
-            c.a = heatMapOpacity;
-            heatMapColors[v] = c;
-        }
-
-        heatMapMesh.colors = heatMapColors;
-    }
-
-    private void DrawHeatMapMesh()
-    {
-        if (heatMapMaterial == null)
-        {
-            Shader shader = Shader.Find("Hidden/Internal-Colored");
-            if (shader == null) return;
-
-            heatMapMaterial = new Material(shader) { hideFlags = HideFlags.HideAndDontSave };
-            heatMapMaterial.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
-            heatMapMaterial.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
-            heatMapMaterial.SetInt("_Cull", (int)UnityEngine.Rendering.CullMode.Off);
-            heatMapMaterial.SetInt("_ZWrite", 0);
-        }
-
-        heatMapMaterial.SetPass(0);
-        Graphics.DrawMeshNow(heatMapMesh, transform.localToWorldMatrix);
-    }
 }
