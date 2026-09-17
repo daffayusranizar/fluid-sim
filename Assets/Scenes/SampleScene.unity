@@ -165,10 +165,27 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::SPH2D
   boxSize: {x: 10, y: 10}
   numToSpawn: {x: 10, y: 10}
-  spawnCenter: {x: 0, y: 0}
-  particleSpacing: 0.6
+  spawnCenter: {x: 0, y: 2}
+  particleSpacing: 0.4
   gravity: {x: 0, y: -9.81}
   collisionDamping: 0.5
+  smoothingLength: 1
+  debugParticle: 0
+  subSteps: 8
+  restDensity: 10
+  autoParticleMass: 1
+  particleMass: 0.1
+  stiffness: 100
+  clampPressurePositive: 1
+  showPressureColor: 1
+  useRandomSpawn: 1
+  debugLogs: 0
+  showForceArrows: 1
+  forceArrowLength: 0.4
+  showPressureHeatMap: 1
+  heatMapResolution: 40
+  heatMapBlur: 1.5
+  heatMapOpacity: 0.6
 --- !u!1 &330585543
 GameObject:
   m_ObjectHideFlags: 0
