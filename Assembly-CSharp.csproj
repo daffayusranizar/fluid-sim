@@ -53,9 +53,11 @@
     <Analyzer Include="/Applications/Unity/Hub/Editor/6000.6.0f1/Unity.app/Contents/Resources/Scripting/BCLExtensions/TargetingPacks/netstandard2.1/analyzers/dotnet/roslyn4.0/cs/System.Text.Json.SourceGeneration.dll" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="Assets/Scripts/SPHMath.cs" />
     <Compile Include="Assets/Scripts/Particle2D.cs" />
     <Compile Include="Assets/Scripts/SPHGrid.cs" />
     <Compile Include="Assets/TutorialInfo/Readme.cs" />
+    <Compile Include="Assets/Scripts/SPHSolver.cs" />
     <Compile Include="Assets/Scripts/SPH2D.cs" />
   </ItemGroup>
   <ItemGroup>

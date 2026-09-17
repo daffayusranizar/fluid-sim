@@ -84,6 +84,17 @@ public class SPH2D : MonoBehaviour
     private float timeAccumulator;
     private float lastStepSize;
 
+    private readonly System.Diagnostics.Stopwatch solverTimer = new System.Diagnostics.Stopwatch();
+    private double lastSolverMs;
+
+    // Managed snapshots for the editor-only renderers. Reading a NativeArray from
+    // managed code goes through the safety system on every index access, and the
+    // heat map alone does resolution^2 * particleCount of them per frame. One
+    // bulk copy per frame is far cheaper than that.
+    private Particle2D[] renderParticles;
+    private float2[] renderViscosityForces;
+    private float2[] renderBoundary;
+
     // --- Heat map (debug only, handled in managed space) ---
     private Mesh heatMapMesh;
     private Material heatMapMaterial;
@@ -321,6 +332,10 @@ public class SPH2D : MonoBehaviour
         {
             boundaryParticles[i] = found[i];
         }
+
+        // Static, so one snapshot at spawn is enough for the debug renderer
+        renderBoundary = new float2[boundaryCount];
+        boundaryParticles.GetSubArray(0, boundaryCount).CopyTo(renderBoundary);
     }
 
     /// <summary>
@@ -371,6 +386,8 @@ public class SPH2D : MonoBehaviour
 
         int steps = 0;
 
+        solverTimer.Restart();
+
         while (timeAccumulator > 0f && steps < maxSubSteps)
         {
             SolveStep();
@@ -394,10 +411,13 @@ public class SPH2D : MonoBehaviour
         // death where it falls further behind the frame rate every frame.
         timeAccumulator = 0f;
 
+        solverTimer.Stop();
+        lastSolverMs = solverTimer.Elapsed.TotalMilliseconds;
+
         if (debugLogs)
         {
-            Debug.Log($"steps={steps}, dt={lastStepSize:F5}, mass={particleMass:F2}, " +
-                      $"h={smoothingLength:F3}, boundary={boundaryCount}");
+            Debug.Log($"steps={steps}, dt={lastStepSize:F5}, solver={lastSolverMs:F2}ms, " +
+                      $"h={smoothingLength:F3}, mass={particleMass:F2}, boundary={boundaryCount}");
         }
     }
 
@@ -420,22 +440,48 @@ public class SPH2D : MonoBehaviour
 
     private int HeatMapResolutionClamped => Mathf.Clamp(heatMapResolution, 2, 512);
 
+    /// <summary>
+    /// Copies native state into managed arrays for the gizmo and heat map code.
+    /// Called once per frame from OnDrawGizmos, which is the only consumer.
+    /// </summary>
+    private void RefreshRenderSnapshot()
+    {
+        if (renderParticles == null || renderParticles.Length != particles.Length)
+        {
+            renderParticles = new Particle2D[particles.Length];
+        }
+
+        particles.CopyTo(renderParticles);
+
+        if (viscosityForces.IsCreated)
+        {
+            if (renderViscosityForces == null || renderViscosityForces.Length != viscosityForces.Length)
+            {
+                renderViscosityForces = new float2[viscosityForces.Length];
+            }
+
+            viscosityForces.CopyTo(renderViscosityForces);
+        }
+    }
+
     private void OnDrawGizmos()
     {
         if (!particles.IsCreated) return;
+
+        RefreshRenderSnapshot();
 
         // 1. Draw container
         Gizmos.color = Color.blue;
         Gizmos.DrawWireCube(transform.position, new Vector3(boxSize.x, boxSize.y, 0f));
 
         // 1a. Boundary particles (static solid material just outside the walls)
-        if (boundaryParticles.IsCreated && useBoundaryParticles)
+        if (renderBoundary != null && useBoundaryParticles)
         {
             Gizmos.color = new Color(0.4f, 0.4f, 0.4f, 1f);
 
-            for (int b = 0; b < boundaryCount; b++)
+            for (int b = 0; b < renderBoundary.Length; b++)
             {
-                Gizmos.DrawSphere(new Vector3(boundaryParticles[b].x, boundaryParticles[b].y, 0f), 0.05f);
+                Gizmos.DrawSphere(new Vector3(renderBoundary[b].x, renderBoundary[b].y, 0f), 0.05f);
             }
         }
 
@@ -447,9 +493,9 @@ public class SPH2D : MonoBehaviour
 
         // 2. Draw particles colored by density or pressure
         // Low value = blue, high value = red
-        for (int i = 0; i < particles.Length; i++)
+        for (int i = 0; i < renderParticles.Length; i++)
         {
-            Particle2D particle = particles[i];
+            Particle2D particle = renderParticles[i];
 
             float value = showPressureColor ? particle.pressure : particle.density;
             float maxValue = showPressureColor ? stiffness * (restDensity * 0.5f) : restDensity * 1.5f;
@@ -461,9 +507,9 @@ public class SPH2D : MonoBehaviour
 
         // 3. Force arrows
         // Direction = force direction. Color = force magnitude (weak -> strong)
-        if (showViscosityArrows && viscosityForces.IsCreated)
+        if (showViscosityArrows && renderViscosityForces != null)
         {
-            DrawArrows(viscosityForces, Color.yellow, new Color(1f, 0.35f, 0f));
+            DrawArrows(renderViscosityForces, Color.yellow, new Color(1f, 0.35f, 0f));
         }
         else if (showForceArrows)
         {
@@ -474,7 +520,7 @@ public class SPH2D : MonoBehaviour
         DrawDebugNeighbors();
     }
 
-    private void DrawArrows(NativeArray<float2> forces, Color weak, Color strong)
+    private void DrawArrows(float2[] forces, Color weak, Color strong)
     {
         float maxMag = 1e-6f;
 
@@ -490,7 +536,7 @@ public class SPH2D : MonoBehaviour
             float mag = math.length(f);
             if (mag < 1e-6f) continue;
 
-            float2 pos = particles[i].position;
+            float2 pos = renderParticles[i].position;
             Vector3 origin = new Vector3(pos.x, pos.y, 0f);
             Vector3 dir = new Vector3(f.x / mag, f.y / mag, 0f);
 
@@ -503,19 +549,19 @@ public class SPH2D : MonoBehaviour
     {
         float maxForce = 1e-6f;
 
-        for (int i = 0; i < particles.Length; i++)
+        for (int i = 0; i < renderParticles.Length; i++)
         {
-            float mag = math.length(particles[i].force);
+            float mag = math.length(renderParticles[i].force);
             if (mag > maxForce) maxForce = mag;
         }
 
-        for (int i = 0; i < particles.Length; i++)
+        for (int i = 0; i < renderParticles.Length; i++)
         {
-            float2 f = particles[i].force;
+            float2 f = renderParticles[i].force;
             float mag = math.length(f);
             if (mag < 1e-6f) continue;
 
-            float2 pos = particles[i].position;
+            float2 pos = renderParticles[i].position;
             Vector3 origin = new Vector3(pos.x, pos.y, 0f);
             Vector3 dir = new Vector3(f.x / mag, f.y / mag, 0f);
 
@@ -530,19 +576,19 @@ public class SPH2D : MonoBehaviour
     /// </summary>
     private void DrawDebugNeighbors()
     {
-        if (!neighbors.fluidStart.IsCreated || particles.Length == 0) return;
+        if (!neighbors.fluidStart.IsCreated || renderParticles.Length == 0) return;
 
-        int target = Mathf.Clamp(debugParticle, 0, particles.Length - 1);
+        int target = Mathf.Clamp(debugParticle, 0, renderParticles.Length - 1);
 
         Gizmos.color = Color.red;
-        float2 targetPos = particles[target].position;
+        float2 targetPos = renderParticles[target].position;
         Gizmos.DrawWireSphere(new Vector3(targetPos.x, targetPos.y, 0f), 0.12f);
 
         Gizmos.color = Color.green;
 
         for (int k = neighbors.fluidStart[target]; k < neighbors.fluidStart[target + 1]; k++)
         {
-            float2 otherPos = particles[neighbors.fluid[k]].position;
+            float2 otherPos = renderParticles[neighbors.fluid[k]].position;
             Gizmos.DrawLine(
                 new Vector3(targetPos.x, targetPos.y, 0f),
                 new Vector3(otherPos.x, otherPos.y, 0f));
@@ -645,9 +691,9 @@ public class SPH2D : MonoBehaviour
         // Auto-range so the heat map always shows contrast
         float maxAbs = 1f;
 
-        for (int i = 0; i < particles.Length; i++)
+        for (int i = 0; i < renderParticles.Length; i++)
         {
-            float absP = Mathf.Abs(particles[i].pressure);
+            float absP = Mathf.Abs(renderParticles[i].pressure);
             if (absP > maxAbs) maxAbs = absP;
         }
 
@@ -660,15 +706,15 @@ public class SPH2D : MonoBehaviour
             float weightedPressure = 0f;
             float weightSum = 0f;
 
-            for (int i = 0; i < particles.Length; i++)
+            for (int i = 0; i < renderParticles.Length; i++)
             {
-                float r2 = math.distancesq(particles[i].position, sample);
+                float r2 = math.distancesq(renderParticles[i].position, sample);
 
                 if (r2 < h2)
                 {
                     float diff = h2 - r2;
                     float w = poly6Const * diff * diff * diff;
-                    weightedPressure += particles[i].pressure * w;
+                    weightedPressure += renderParticles[i].pressure * w;
                     weightSum += w;
                 }
             }
