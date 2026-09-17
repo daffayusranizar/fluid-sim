@@ -54,7 +54,7 @@
   </ItemGroup>
   <ItemGroup>
     <Compile Include="Assets/TutorialInfo/Readme.cs" />
-    <Compile Include="Assets/SPH2D.cs" />
+    <Compile Include="Assets/Scripts/SPH2D.cs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="Assets/TutorialInfo/StyleSheets/ReadmeEditor.uss" />
