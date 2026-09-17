@@ -1,12 +1,23 @@
+using Unity.Collections;
+using Unity.Mathematics;
 using UnityEngine;
-using System.Collections.Generic;
 
+/// <summary>
+/// 2D weakly compressible SPH solver.
+///
+/// This MonoBehaviour owns state and orchestration only. Particle data lives in
+/// NativeArrays so the Burst-compiled solver passes in SPHSolver can read it
+/// directly, and the neighbour structure is built by SPHGrid.
+/// </summary>
 public class SPH2D : MonoBehaviour
 {
+    [Header("Container")]
     public Vector2 boxSize = new Vector2(20f, 20f);
 
+    [Header("Particles")]
     public Vector2Int numToSpawn = new Vector2Int(20, 20);
 
+    [Header("Physics")]
     public Vector2 gravity = new Vector2(0f, -9.81f);
     public float collisionDamping = 0.5f;
 
@@ -59,16 +70,21 @@ public class SPH2D : MonoBehaviour
     [Range(1f, 3f)] public float heatMapBlur = 1.5f;
     [Range(0f, 1f)] public float heatMapOpacity = 0.6f;
 
-    private Particle2D[] particles;
-    private SPHGrid grid = new SPHGrid();
+    // --- Native simulation state ---
+    private NativeArray<Particle2D> particles;
+    private NativeArray<float2> boundaryParticles;
+    private NativeArray<float2> viscosityForces;
+    private NeighborLists neighbors;
 
-    private Vector2[] viscosityForces;
-    private Vector2[] boundaryParticles;
-    private float boundaryVolume;
+    private SPHGrid grid;
+    private SolverParams solverParams;
+    private int boundaryCount;
+
     private float spawnSpacing = 1f;
     private float timeAccumulator;
     private float lastStepSize;
 
+    // --- Heat map (debug only, handled in managed space) ---
     private Mesh heatMapMesh;
     private Material heatMapMaterial;
     private Vector3[] heatMapVerts;
@@ -80,59 +96,85 @@ public class SPH2D : MonoBehaviour
 
     private void Awake()
     {
+        particles = new NativeArray<Particle2D>(TotalParticles, Allocator.Persistent);
+        viscosityForces = new NativeArray<float2>(TotalParticles, Allocator.Persistent);
+
         SpawnParticles();
 
-        // Scale particle mass so the spawn's mean density lands on restDensity.
-        // Without this, restDensity and particleMass must be hand-matched or the
-        // pressure field starts far from rest and the fluid explodes on frame one.
+        // The grid and density passes need solver parameters, so build them
+        // before the mass calibration that reads density.
+        BuildSolverParams();
+
         if (autoParticleMass) CalibrateParticleMass();
 
         SpawnBoundaryParticles();
+        BuildSolverParams();
     }
 
-    // Measures the density of the spawn using unit mass, then rescales mass so
-    // the mean density equals restDensity. Makes the parameters self-consistent.
-    private void CalibrateParticleMass()
+    private void OnDestroy()
     {
-        particleMass = 1f;
+        if (particles.IsCreated) particles.Dispose();
+        if (viscosityForces.IsCreated) viscosityForces.Dispose();
+        if (boundaryParticles.IsCreated) boundaryParticles.Dispose();
 
-        FindNeighbors();
-        ComputeDensity();
+        grid.Dispose();
 
-        float sum = 0f;
-        int count = 0;
-
-        for (int i = 0; i < particles.Length; i++)
+        if (heatMapMesh != null)
         {
-            if (particles[i].density > 0f)
-            {
-                sum += particles[i].density;
-                count++;
-            }
+            if (Application.isPlaying) Destroy(heatMapMesh);
+            else DestroyImmediate(heatMapMesh);
         }
 
-        if (count > 0)
+        if (heatMapMaterial != null)
         {
-            float meanDensity = sum / count;
-
-            // Calibrating to exactly restDensity would leave the fluid at uniform
-            // pressure, and a uniform pressure has zero gradient -- so nothing would
-            // move. Spawning denser raises the interior pressure above the free
-            // surface, and that difference is the gradient that drives the flow.
-            particleMass = (restDensity * spawnCompression) / meanDensity;
+            if (Application.isPlaying) Destroy(heatMapMaterial);
+            else DestroyImmediate(heatMapMaterial);
         }
     }
 
+    /// <summary>
+    /// Packs all tuning values into the blittable struct the Burst passes take.
+    /// At T-026 this becomes the compute shader's constant buffer almost verbatim.
+    /// </summary>
+    private void BuildSolverParams()
+    {
+        float h = smoothingLength;
+
+        solverParams = new SolverParams
+        {
+            smoothingLength = h,
+            smoothingLengthSq = h * h,
+            poly6Const = SPHMath.Poly6Constant(h),
+            spikyConst = SPHMath.SpikyGradientConstant(h),
+            viscConst = SPHMath.ViscosityLaplacianConstant(h),
+
+            restDensity = restDensity,
+            particleMass = particleMass,
+            stiffness = stiffness,
+            clampPressurePositive = clampPressurePositive,
+
+            viscosity = viscosity,
+
+            boundaryVolume = spawnSpacing * spawnSpacing,
+            useBoundaryParticles = useBoundaryParticles && boundaryCount > 0,
+
+            gravity = new float2(gravity.x, gravity.y),
+            boxCenter = new float2(transform.position.x, transform.position.y),
+            boxHalfSize = new float2(boxSize.x * 0.5f, boxSize.y * 0.5f),
+            collisionDamping = collisionDamping,
+        };
+    }
+
+    /// <summary>
+    /// Blue-noise scatter: random positions with a minimum separation.
+    ///
+    /// Pure uniform random creates dense clumps and empty voids. The local
+    /// density then swings far from restDensity and the pressure force spikes.
+    /// Enforcing a minimum separation keeps the packing even while the layout
+    /// still looks irregular.
+    /// </summary>
     private void SpawnParticles()
     {
-        particles = new Particle2D[TotalParticles];
-
-        // The fluid starts packed into a sub-region of the container.
-        //
-        // A uniform density field has zero pressure gradient, and force comes from
-        // the gradient -- so filling the whole canvas leaves the fluid jammed
-        // against the walls with nothing to do. Packing it into part of the canvas
-        // gives it room to move into, which is what produces visible flow.
         Vector2 canvasCenter = transform.position;
 
         Vector2 sizeFraction = new Vector2(
@@ -150,7 +192,6 @@ public class SPH2D : MonoBehaviour
             spawnRegionCenter.x * maxOffset.x,
             spawnRegionCenter.y * maxOffset.y);
 
-        // Blue-noise spacing derived from the region the fluid actually occupies
         float area = regionSize.x * regionSize.y;
         float nominalSpacing = Mathf.Sqrt(area / Mathf.Max(1, TotalParticles));
         spawnSpacing = nominalSpacing;
@@ -165,19 +206,19 @@ public class SPH2D : MonoBehaviour
 
         for (int i = 0; i < TotalParticles; i++)
         {
-            Vector2 candidate = regionCenter;
+            float2 candidate = regionCenter;
 
             for (int attempt = 0; attempt < maxAttempts; attempt++)
             {
-                candidate = regionCenter + new Vector2(
-                    Random.Range(-regionSize.x * 0.5f, regionSize.x * 0.5f),
-                    Random.Range(-regionSize.y * 0.5f, regionSize.y * 0.5f)
-                );
+                candidate = new float2(
+                    regionCenter.x + UnityEngine.Random.Range(-regionSize.x * 0.5f, regionSize.x * 0.5f),
+                    regionCenter.y + UnityEngine.Random.Range(-regionSize.y * 0.5f, regionSize.y * 0.5f));
 
                 bool accepted = true;
+
                 for (int k = 0; k < i; k++)
                 {
-                    if ((particles[k].position - candidate).sqrMagnitude < minDistSq)
+                    if (math.distancesq(particles[k].position, candidate) < minDistSq)
                     {
                         accepted = false;
                         break;
@@ -190,312 +231,49 @@ public class SPH2D : MonoBehaviour
             particles[i] = new Particle2D
             {
                 position = candidate,
-                velocity = Vector2.zero,
-                force = Vector2.zero,
+                velocity = float2.zero,
+                force = float2.zero,
                 density = 0f,
-                pressure = 0f
+                pressure = 0f,
             };
         }
     }
 
-    private void Update()
+    /// <summary>
+    /// Scales particle mass so the spawn's mean density lands on restDensity.
+    ///
+    /// Calibrating to exactly restDensity would leave the fluid at uniform
+    /// pressure, and a uniform pressure has zero gradient -- so nothing would
+    /// move. spawnCompression raises the interior pressure above the free
+    /// surface, and that difference is the gradient that drives the flow.
+    /// </summary>
+    private void CalibrateParticleMass()
     {
-        if (particles == null)
-            return;
+        particleMass = 1f;
+        BuildSolverParams();
 
-        // Frame time goes into a buffer rather than straight into the integrator.
-        // The solver then consumes it in steps small enough to stay stable, so a
-        // slow frame produces more steps instead of one large unstable step.
-        timeAccumulator += Time.deltaTime;
+        RebuildNeighbors();
+        SPHSolver.ComputeDensity(particles, neighbors, BoundaryView(), solverParams);
 
-        int steps = 0;
+        float meanDensity = SPHSolver.MeanDensity(particles);
 
-        while (timeAccumulator > 0f && steps < maxSubSteps)
+        if (meanDensity > 0f)
         {
-            // Size the step from the current state, then never step past the
-            // remaining budget so the simulation stays in sync with real time.
-            float dt = Mathf.Clamp(ComputeStableTimeStep(), minTimeStep, maxTimeStep);
-            dt = Mathf.Min(dt, timeAccumulator);
-            lastStepSize = dt;
-
-            FindNeighbors();
-            ComputeDensity();
-            ComputePressure();
-
-            // Zero the accumulators once, then let every force pass add into them
-            ResetForces();
-            ComputePressureForce();
-            ComputeViscosityForce();
-
-            Integrate(dt);
-
-            timeAccumulator -= dt;
-            steps++;
-        }
-
-        // Drop any backlog. A long hitch must not put the solver into a spiral of
-        // death where it falls further behind the frame rate every frame.
-        timeAccumulator = 0f;
-
-        // DEBUG: log density/pressure per particle so you can verify the Tait EOS
-        if (debugLogs)
-        {
-            Debug.Log($"steps={steps}, dt={lastStepSize:F5}");
-
-            for (int i = 0; i < particles.Length; i++)
-            {
-                Debug.Log($"Particle {i}: density={particles[i].density:F2}, pressure={particles[i].pressure:F2}");
-            }
-        }
-
-    }
-
-    // Largest step that keeps the explicit integration stable.
-    //
-    // CFL limit: information must not travel further than one smoothing length per
-    // step, so dt <= C * h / (maxSpeed + soundSpeed). The sound speed comes from the
-    // equation of state: with p = k(rho - rho0) we have dp/drho = k, so c = sqrt(k).
-    // A stiffer fluid therefore forces a smaller step -- this is the price of
-    // weak compressibility.
-    //
-    // Acceleration limit: a particle must not be flung across its own
-    // neighbourhood within a single step.
-    private float ComputeStableTimeStep()
-    {
-        float h = smoothingLength;
-        float soundSpeed = Mathf.Sqrt(Mathf.Max(0f, stiffness));
-
-        float maxSpeed = 0f;
-        float maxAccel = 0f;
-
-        for (int i = 0; i < particles.Length; i++)
-        {
-            float speed = particles[i].velocity.magnitude;
-            if (speed > maxSpeed) maxSpeed = speed;
-
-            if (particles[i].density > 0.0001f)
-            {
-                float accel = (particles[i].force / particles[i].density + gravity).magnitude;
-                if (accel > maxAccel) maxAccel = accel;
-            }
-        }
-
-        float dtCfl = cflFactor * h / (maxSpeed + soundSpeed + 0.0001f);
-
-        float dtAcc = maxAccel > 0.0001f
-            ? cflFactor * Mathf.Sqrt(h / maxAccel)
-            : float.MaxValue;
-
-        return Mathf.Min(dtCfl, dtAcc);
-    }
-
-    private void FindNeighbors()
-    {
-        // The grid must cover the container plus one smoothing length of margin,
-        // because boundary particles sit just outside the walls.
-        float margin = smoothingLength * 1.01f;
-        Vector2 domainSize = boxSize + new Vector2(2f * margin, 2f * margin);
-        Vector2 domainOrigin = (Vector2)transform.position - domainSize * 0.5f;
-
-        grid.Rebuild(particles, boundaryParticles, domainOrigin, domainSize, smoothingLength);
-
-        if (debugLogs)
-        {
-            for (int i = 0; i < particles.Length; i++)
-            {
-                Debug.Log($"Particle {i}: {grid.FluidNeighbors[i].Count} fluid, " +
-                          $"{grid.BoundaryNeighbors[i].Count} boundary");
-            }
+            particleMass = (restDensity * spawnCompression) / meanDensity;
+            BuildSolverParams();
         }
     }
 
-    private void ComputeDensity()
-    {
-        float h2 = smoothingLength * smoothingLength;
-        float poly6Const = 4f / (Mathf.PI * Mathf.Pow(smoothingLength, 8f));
-
-        List<int>[] fluidNeighbors = grid.FluidNeighbors;
-        List<int>[] boundaryNeighbors = grid.BoundaryNeighbors;
-
-        for (int i = 0; i < particles.Length; i++)
-        {
-            Vector2 posI = particles[i].position;
-            float density = 0f;
-
-            // Fluid neighbours. The grid already rejected anything beyond h,
-            // so no distance test is needed beyond unpacking the squared range.
-            for (int j = 0; j < fluidNeighbors[i].Count; j++)
-            {
-                int n = fluidNeighbors[i][j];
-                float r2 = (particles[n].position - posI).sqrMagnitude;
-                float diff = h2 - r2;
-                density += particleMass * poly6Const * diff * diff * diff;
-            }
-
-            // Boundary particles stand for solid material just beyond the wall.
-            // Near a wall roughly half the kernel support lies inside the solid, so
-            // without these contributions the density is badly under-estimated and
-            // the pressure that should push the fluid off the wall never appears.
-            for (int b = 0; b < boundaryNeighbors[i].Count; b++)
-            {
-                Vector2 boundaryPos = boundaryParticles[boundaryNeighbors[i][b]];
-                float r2 = (boundaryPos - posI).sqrMagnitude;
-                float diff = h2 - r2;
-                density += restDensity * boundaryVolume * poly6Const * diff * diff * diff;
-            }
-
-            particles[i].density = density;
-        }
-    }
-
-    private void ComputePressure()
-    {
-        for (int i = 0; i < particles.Length; i++)
-        {
-            // Tait equation of state: p = k * (density - restDensity)
-            float p = stiffness * (particles[i].density - restDensity);
-
-            // Clamping away negative pressure removes cohesion, which otherwise
-            // makes particles string together and stick at free surfaces.
-            if (clampPressurePositive && p < 0f) p = 0f;
-
-            particles[i].pressure = p;
-        }
-    }
-
-    // Turns the scalar pressure field into a vector force between neighbors.
-    // Uses the Spiky kernel gradient, whose non-zero value at r = 0 prevents clumping.
-    private void ComputePressureForce()
-    {
-        float h = smoothingLength;
-
-        // Magnitude of the 2D Spiky gradient: |dW/dr| = 30 / (pi h^5) * (h - r)^2
-        // It stays non-zero at r = 0, which is what keeps particles from overlapping.
-        float spikyGradMag = 30f / (Mathf.PI * Mathf.Pow(h, 5f));
-
-        List<int>[] fluidNeighbors = grid.FluidNeighbors;
-        List<int>[] boundaryNeighbors = grid.BoundaryNeighbors;
-
-        for (int i = 0; i < particles.Length; i++)
-        {
-            Vector2 posI = particles[i].position;
-
-            for (int j = 0; j < fluidNeighbors[i].Count; j++)
-            {
-                int n = fluidNeighbors[i][j];
-
-                // Guard against zero density from isolated particles
-                if (particles[n].density <= 0.0001f) continue;
-
-                // Points from neighbor j to particle i
-                Vector2 rVec = posI - particles[n].position;
-                float r2 = rVec.sqrMagnitude;
-                if (r2 <= 0f) continue;
-
-                float r = Mathf.Sqrt(r2);
-                Vector2 dir = rVec / r;
-                float hr = h - r;
-
-                // Muller Eqn (10): m_j * (p_i + p_j) / (2 rho_j) * gradW_spiky
-                //
-                // Sign check: f_i = -(p_i + p_j) * gradW, and gradW points from i to j.
-                // So with positive pressure the force must point from j to i (away from j).
-                float contribution = particleMass
-                                     * (particles[i].pressure + particles[n].pressure)
-                                     / (2f * particles[n].density)
-                                     * spikyGradMag * hr * hr;
-
-                particles[i].force += dir * contribution;
-            }
-
-            // Boundary particles push back using this fluid particle's own pressure
-            // (pressure mirroring), which is what enforces no-penetration at the wall.
-            float pressure = particles[i].pressure;
-
-            for (int b = 0; b < boundaryNeighbors[i].Count; b++)
-            {
-                // Points from the boundary particle to the fluid particle (inward)
-                Vector2 rVec = posI - boundaryParticles[boundaryNeighbors[i][b]];
-                float r2 = rVec.sqrMagnitude;
-                if (r2 <= 0f) continue;
-
-                float r = Mathf.Sqrt(r2);
-                Vector2 dir = rVec / r;
-                float hr = h - r;
-
-                // m_b = restDensity * V_b, and mirroring gives p_b = p_i and
-                // rho_b = restDensity, so the coefficient collapses to V_b * p_i.
-                particles[i].force += dir * (boundaryVolume * pressure * spikyGradMag * hr * hr);
-            }
-        }
-    }
-
-    // Zeroes every particle's force accumulator. Called once per step, before the
-    // individual force passes add their contributions.
-    private void ResetForces()
-    {
-        for (int i = 0; i < particles.Length; i++)
-        {
-            particles[i].force = Vector2.zero;
-        }
-    }
-
-    // Internal friction: drags each particle's velocity toward its neighbours'.
-    // This is the only dissipative term in the solver, so it is what allows the
-    // fluid to settle instead of sloshing forever.
-    private void ComputeViscosityForce()
-    {
-        float h = smoothingLength;
-
-        // Laplacian of the 2D viscosity kernel: 40 / (pi h^5) * (h - r).
-        // It is positive everywhere for 0 <= r <= h, which guarantees the force
-        // always shrinks velocity differences instead of growing them.
-        float viscLapMag = 40f / (Mathf.PI * Mathf.Pow(h, 5f));
-
-        if (viscosityForces == null || viscosityForces.Length != particles.Length)
-        {
-            viscosityForces = new Vector2[particles.Length];
-        }
-
-        List<int>[] fluidNeighbors = grid.FluidNeighbors;
-
-        for (int i = 0; i < particles.Length; i++)
-        {
-            Vector2 posI = particles[i].position;
-            Vector2 velI = particles[i].velocity;
-            Vector2 viscForce = Vector2.zero;
-
-            for (int j = 0; j < fluidNeighbors[i].Count; j++)
-            {
-                int n = fluidNeighbors[i][j];
-
-                if (particles[n].density <= 0.0001f) continue;
-
-                float r = Mathf.Sqrt((particles[n].position - posI).sqrMagnitude);
-
-                // Muller Eqn (14): mu * m_j * (v_j - v_i) / rho_j * laplacian(W_visc)
-                // The direction lives in (v_j - v_i), so the force always pulls this
-                // particle's velocity toward the neighbour's.
-                viscForce += viscosity
-                             * particleMass
-                             * (particles[n].velocity - velI)
-                             / particles[n].density
-                             * viscLapMag * (h - r);
-            }
-
-            viscosityForces[i] = viscForce;
-            particles[i].force += viscForce;
-        }
-    }
-
-    // Lays a layer of static particles inside the solid, just beyond each wall.
-    // They exist only to complete the fluid's kernel support near the wall and to
-    // push back when the fluid compresses against it.
+    /// <summary>
+    /// Lays a layer of static particles inside the solid, just beyond each wall.
+    /// They exist only to complete the fluid's kernel support near the wall and to
+    /// push back when the fluid compresses against it.
+    /// </summary>
     private void SpawnBoundaryParticles()
     {
         if (!useBoundaryParticles)
         {
-            boundaryParticles = null;
+            boundaryCount = 0;
             return;
         }
 
@@ -510,101 +288,288 @@ public class SPH2D : MonoBehaviour
         float stepX = (boxSize.x + 2f * margin) / nx;
         float stepY = (boxSize.y + 2f * margin) / ny;
 
-        List<Vector2> list = new List<Vector2>();
+        // NativeArray is fixed size, so gather into a list first, then copy.
+        var found = new System.Collections.Generic.List<float2>(nx * ny);
 
         for (int y = 0; y < ny; y++)
         {
             for (int x = 0; x < nx; x++)
             {
-                Vector2 pos = new Vector2(
-                    center.x - half.x - margin + (x + 0.5f) * stepX,
-                    center.y - half.y - margin + (y + 0.5f) * stepY);
+                float px = center.x - half.x - margin + (x + 0.5f) * stepX;
+                float py = center.y - half.y - margin + (y + 0.5f) * stepY;
 
-                Vector2 rel = pos - center;
-
-                // How far outside the fluid domain this sample sits
-                float outsideX = Mathf.Max(0f, Mathf.Abs(rel.x) - half.x);
-                float outsideY = Mathf.Max(0f, Mathf.Abs(rel.y) - half.y);
+                float outsideX = Mathf.Max(0f, Mathf.Abs(px - center.x) - half.x);
+                float outsideY = Mathf.Max(0f, Mathf.Abs(py - center.y) - half.y);
 
                 // Skip samples inside the fluid domain
                 if (outsideX <= 0f && outsideY <= 0f) continue;
 
                 // Skip samples too deep into the solid to matter
-                float distToWall = Mathf.Sqrt(outsideX * outsideX + outsideY * outsideY);
-                if (distToWall > margin) continue;
+                if (Mathf.Sqrt(outsideX * outsideX + outsideY * outsideY) > margin) continue;
 
-                list.Add(pos);
+                found.Add(new float2(px, py));
             }
         }
 
-        boundaryParticles = list.ToArray();
-        boundaryVolume = stepX * stepY;
+        if (boundaryParticles.IsCreated) boundaryParticles.Dispose();
+
+        boundaryCount = found.Count;
+        boundaryParticles = new NativeArray<float2>(
+            Mathf.Max(1, boundaryCount), Allocator.Persistent);
+
+        for (int i = 0; i < boundaryCount; i++)
+        {
+            boundaryParticles[i] = found[i];
+        }
     }
+
+    /// <summary>
+    /// The boundary array as the solver should see it. Returns an empty view when
+    /// boundary particles are disabled, so the toggle takes effect immediately
+    /// without reallocating.
+    /// </summary>
+    private NativeArray<float2> BoundaryView()
+    {
+        if (!boundaryParticles.IsCreated || !useBoundaryParticles)
+        {
+            return new NativeArray<float2>();
+        }
+
+        return boundaryParticles.GetSubArray(0, boundaryCount);
+    }
+
+    private void RebuildNeighbors()
+    {
+        // The grid must cover the container plus one smoothing length of margin,
+        // because boundary particles sit just outside the walls.
+        float margin = smoothingLength * 1.01f;
+
+        Vector2 center = transform.position;
+        Vector2 domainSize = boxSize + new Vector2(2f * margin, 2f * margin);
+        float2 domainOrigin = new float2(
+            center.x - domainSize.x * 0.5f,
+            center.y - domainSize.y * 0.5f);
+
+        neighbors = grid.Rebuild(
+            particles,
+            BoundaryView(),
+            domainOrigin,
+            new float2(domainSize.x, domainSize.y),
+            smoothingLength);
+    }
+
+    private void Update()
+    {
+        if (!particles.IsCreated) return;
+
+        BuildSolverParams();
+
+        // Frame time goes into a buffer rather than straight into the integrator.
+        // The solver then consumes it in steps small enough to stay stable, so a
+        // slow frame produces more steps instead of one large unstable step.
+        timeAccumulator += Time.deltaTime;
+
+        int steps = 0;
+
+        while (timeAccumulator > 0f && steps < maxSubSteps)
+        {
+            SolveStep();
+
+            // Size the next step from the state we just produced, then never step
+            // past the remaining budget so the simulation stays in sync with time.
+            float dt = Mathf.Clamp(
+                SPHSolver.ComputeStableTimeStep(particles, solverParams, cflFactor),
+                minTimeStep, maxTimeStep);
+
+            dt = Mathf.Min(dt, timeAccumulator);
+            lastStepSize = dt;
+
+            SPHSolver.Integrate(particles, solverParams, dt);
+
+            timeAccumulator -= dt;
+            steps++;
+        }
+
+        // Drop any backlog. A long hitch must not put the solver into a spiral of
+        // death where it falls further behind the frame rate every frame.
+        timeAccumulator = 0f;
+
+        if (debugLogs)
+        {
+            Debug.Log($"steps={steps}, dt={lastStepSize:F5}, mass={particleMass:F2}, " +
+                      $"h={smoothingLength:F3}, boundary={boundaryCount}");
+        }
+    }
+
+    /// <summary>One full solver pass: neighbours, density, pressure, forces.</summary>
+    private void SolveStep()
+    {
+        RebuildNeighbors();
+
+        SPHSolver.ComputeDensity(particles, neighbors, BoundaryView(), solverParams);
+        SPHSolver.ComputePressure(particles, solverParams);
+
+        SPHSolver.ResetForces(particles);
+        SPHSolver.ComputePressureForce(particles, neighbors, BoundaryView(), solverParams);
+        SPHSolver.ComputeViscosityForce(particles, neighbors, solverParams, viscosityForces);
+    }
+
+    // ------------------------------------------------------------------
+    // Debug visualization
+    // ------------------------------------------------------------------
 
     private int HeatMapResolutionClamped => Mathf.Clamp(heatMapResolution, 2, 512);
 
-    // Semi-implicit (symplectic) Euler. Velocity is updated first, then position
-    // uses the NEW velocity, which damps energy instead of injecting it -- that is
-    // what makes this scheme usable for stiff pressure forces.
-    //
-    // The wall clamp here is now only a penetration safety net. The physics of the
-    // wall is handled by the boundary particles in ComputeDensity and
-    // ComputePressureForce; this just guarantees a particle can never escape if a
-    // step does overshoot.
-    private void Integrate(float dt)
+    private void OnDrawGizmos()
     {
-        Vector2 center = transform.position;
-        float halfX = boxSize.x * 0.5f;
-        float halfY = boxSize.y * 0.5f;
+        if (!particles.IsCreated) return;
 
+        // 1. Draw container
+        Gizmos.color = Color.blue;
+        Gizmos.DrawWireCube(transform.position, new Vector3(boxSize.x, boxSize.y, 0f));
+
+        // 1a. Boundary particles (static solid material just outside the walls)
+        if (boundaryParticles.IsCreated && useBoundaryParticles)
+        {
+            Gizmos.color = new Color(0.4f, 0.4f, 0.4f, 1f);
+
+            for (int b = 0; b < boundaryCount; b++)
+            {
+                Gizmos.DrawSphere(new Vector3(boundaryParticles[b].x, boundaryParticles[b].y, 0f), 0.05f);
+            }
+        }
+
+        // 1b. Pressure heat map across the whole canvas
+        if (showPressureHeatMap)
+        {
+            DrawPressureHeatMap();
+        }
+
+        // 2. Draw particles colored by density or pressure
+        // Low value = blue, high value = red
         for (int i = 0; i < particles.Length; i++)
         {
-            // Isolated particles have no density, so they cannot be accelerated
-            if (particles[i].density <= 0.0001f) continue;
+            Particle2D particle = particles[i];
 
-            // acceleration = pressure force / density + gravity
-            Vector2 acceleration = particles[i].force / particles[i].density + gravity;
+            float value = showPressureColor ? particle.pressure : particle.density;
+            float maxValue = showPressureColor ? stiffness * (restDensity * 0.5f) : restDensity * 1.5f;
+            float t = Mathf.InverseLerp(0f, maxValue, value);
 
-            // Semi-implicit Euler: velocity first, then position with the new velocity
-            particles[i].velocity += acceleration * dt;
-            particles[i].position += particles[i].velocity * dt;
+            Gizmos.color = Color.Lerp(Color.blue, Color.red, t);
+            Gizmos.DrawSphere(new Vector3(particle.position.x, particle.position.y, 0f), 0.08f);
+        }
 
-            // Simple wall clamp so particles stay inside the container
-            Vector2 pos = particles[i].position;
-            Vector2 vel = particles[i].velocity;
+        // 3. Force arrows
+        // Direction = force direction. Color = force magnitude (weak -> strong)
+        if (showViscosityArrows && viscosityForces.IsCreated)
+        {
+            DrawArrows(viscosityForces, Color.yellow, new Color(1f, 0.35f, 0f));
+        }
+        else if (showForceArrows)
+        {
+            DrawParticleArrows();
+        }
 
-            float relX = pos.x - center.x;
-            float relY = pos.y - center.y;
+        // 4. Debug: one particle's neighbour connections
+        DrawDebugNeighbors();
+    }
 
-            if (relX > halfX)
-            {
-                pos.x = center.x + halfX;
-                vel.x *= -collisionDamping;
-            }
-            else if (relX < -halfX)
-            {
-                pos.x = center.x - halfX;
-                vel.x *= -collisionDamping;
-            }
+    private void DrawArrows(NativeArray<float2> forces, Color weak, Color strong)
+    {
+        float maxMag = 1e-6f;
 
-            if (relY > halfY)
-            {
-                pos.y = center.y + halfY;
-                vel.y *= -collisionDamping;
-            }
-            else if (relY < -halfY)
-            {
-                pos.y = center.y - halfY;
-                vel.y *= -collisionDamping;
-            }
+        for (int i = 0; i < forces.Length; i++)
+        {
+            float mag = math.length(forces[i]);
+            if (mag > maxMag) maxMag = mag;
+        }
 
-            particles[i].position = pos;
-            particles[i].velocity = vel;
+        for (int i = 0; i < forces.Length; i++)
+        {
+            float2 f = forces[i];
+            float mag = math.length(f);
+            if (mag < 1e-6f) continue;
+
+            float2 pos = particles[i].position;
+            Vector3 origin = new Vector3(pos.x, pos.y, 0f);
+            Vector3 dir = new Vector3(f.x / mag, f.y / mag, 0f);
+
+            Gizmos.color = Color.Lerp(weak, strong, Mathf.InverseLerp(0f, maxMag, mag));
+            Gizmos.DrawLine(origin, origin + dir * forceArrowLength);
         }
     }
 
-    // Builds a quad-grid mesh covering the container. Vertex colors are written
-    // each frame; the GPU interpolates between them, which gives a smooth field.
+    private void DrawParticleArrows()
+    {
+        float maxForce = 1e-6f;
+
+        for (int i = 0; i < particles.Length; i++)
+        {
+            float mag = math.length(particles[i].force);
+            if (mag > maxForce) maxForce = mag;
+        }
+
+        for (int i = 0; i < particles.Length; i++)
+        {
+            float2 f = particles[i].force;
+            float mag = math.length(f);
+            if (mag < 1e-6f) continue;
+
+            float2 pos = particles[i].position;
+            Vector3 origin = new Vector3(pos.x, pos.y, 0f);
+            Vector3 dir = new Vector3(f.x / mag, f.y / mag, 0f);
+
+            Gizmos.color = Color.Lerp(Color.cyan, Color.magenta, Mathf.InverseLerp(0f, maxForce, mag));
+            Gizmos.DrawLine(origin, origin + dir * forceArrowLength);
+        }
+    }
+
+    /// <summary>
+    /// Draws only one particle's neighbour connections, so you can tell which
+    /// connections belong to whom. Drawing them all produces an unreadable mesh.
+    /// </summary>
+    private void DrawDebugNeighbors()
+    {
+        if (!neighbors.fluidStart.IsCreated || particles.Length == 0) return;
+
+        int target = Mathf.Clamp(debugParticle, 0, particles.Length - 1);
+
+        Gizmos.color = Color.red;
+        float2 targetPos = particles[target].position;
+        Gizmos.DrawWireSphere(new Vector3(targetPos.x, targetPos.y, 0f), 0.12f);
+
+        Gizmos.color = Color.green;
+
+        for (int k = neighbors.fluidStart[target]; k < neighbors.fluidStart[target + 1]; k++)
+        {
+            float2 otherPos = particles[neighbors.fluid[k]].position;
+            Gizmos.DrawLine(
+                new Vector3(targetPos.x, targetPos.y, 0f),
+                new Vector3(otherPos.x, otherPos.y, 0f));
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Heat map: samples the pressure field into a vertex-coloured mesh
+    // ------------------------------------------------------------------
+
+    private void DrawPressureHeatMap()
+    {
+        if (heatMapMesh == null ||
+            builtHeatMapResolution != HeatMapResolutionClamped ||
+            builtBoxSize != boxSize)
+        {
+            RebuildHeatMapMesh();
+        }
+
+        UpdateHeatMapColors();
+        DrawHeatMapMesh();
+    }
+
+    /// <summary>
+    /// Builds a quad-grid mesh covering the container. Vertex colors are written
+    /// each frame; the GPU interpolates between them, which gives a smooth field.
+    /// </summary>
     private void RebuildHeatMapMesh()
     {
         int res = HeatMapResolutionClamped;
@@ -665,8 +630,10 @@ public class SPH2D : MonoBehaviour
         builtBoxSize = boxSize;
     }
 
-    // Samples the pressure field at every mesh vertex and writes the vertex colors:
-    // blue = below rest density, white = at rest density, red = above rest density
+    /// <summary>
+    /// Samples the pressure field at every mesh vertex and writes the vertex colors:
+    /// blue = below rest density, white = at rest density, red = above rest density
+    /// </summary>
     private void UpdateHeatMapColors()
     {
         // Sample with a wider kernel than the physics kernel to smooth the field
@@ -677,6 +644,7 @@ public class SPH2D : MonoBehaviour
 
         // Auto-range so the heat map always shows contrast
         float maxAbs = 1f;
+
         for (int i = 0; i < particles.Length; i++)
         {
             float absP = Mathf.Abs(particles[i].pressure);
@@ -685,14 +653,17 @@ public class SPH2D : MonoBehaviour
 
         for (int v = 0; v < heatMapVerts.Length; v++)
         {
-            Vector2 sample = center + new Vector2(heatMapVerts[v].x, heatMapVerts[v].y);
+            float2 sample = new float2(
+                center.x + heatMapVerts[v].x,
+                center.y + heatMapVerts[v].y);
 
             float weightedPressure = 0f;
             float weightSum = 0f;
 
             for (int i = 0; i < particles.Length; i++)
             {
-                float r2 = (particles[i].position - sample).sqrMagnitude;
+                float r2 = math.distancesq(particles[i].position, sample);
+
                 if (r2 < h2)
                 {
                     float diff = h2 - r2;
@@ -715,6 +686,7 @@ public class SPH2D : MonoBehaviour
             Color c = t < 0f
                 ? Color.Lerp(Color.white, Color.blue, -t)
                 : Color.Lerp(Color.white, Color.red, t);
+
             c.a = heatMapOpacity;
             heatMapColors[v] = c;
         }
@@ -739,145 +711,4 @@ public class SPH2D : MonoBehaviour
         heatMapMaterial.SetPass(0);
         Graphics.DrawMeshNow(heatMapMesh, transform.localToWorldMatrix);
     }
-
-    private void DrawPressureHeatMap()
-    {
-        if (heatMapMesh == null ||
-            builtHeatMapResolution != HeatMapResolutionClamped ||
-            builtBoxSize != boxSize)
-        {
-            RebuildHeatMapMesh();
-        }
-
-        UpdateHeatMapColors();
-        DrawHeatMapMesh();
-    }
-
-    private void OnDestroy()
-    {
-        if (heatMapMesh != null)
-        {
-            if (Application.isPlaying) Destroy(heatMapMesh);
-            else DestroyImmediate(heatMapMesh);
-        }
-
-        if (heatMapMaterial != null)
-        {
-            if (Application.isPlaying) Destroy(heatMapMaterial);
-            else DestroyImmediate(heatMapMaterial);
-        }
-    }
-                                                                                   
-    private void OnDrawGizmos()
-    {
-        
-        if (particles == null) return;                                            
-                                                                                 
-       // 1. Draw container                                                      
-       Gizmos.color = Color.blue;                                                
-       Gizmos.DrawWireCube(transform.position, new Vector3(boxSize.x, boxSize.y, 0f));                                                                           
-
-       // 1a. Boundary particles (static solid material just outside the walls)
-       if (useBoundaryParticles && boundaryParticles != null)
-       {
-           Gizmos.color = new Color(0.4f, 0.4f, 0.4f, 1f);
-           for (int b = 0; b < boundaryParticles.Length; b++)
-           {
-               Gizmos.DrawSphere(new Vector3(boundaryParticles[b].x, boundaryParticles[b].y, 0f), 0.05f);
-           }
-       }
-
-       // 1b. Pressure heat map across the whole canvas
-       if (showPressureHeatMap)
-       {
-           DrawPressureHeatMap();
-       }
-                                                                                 
-       // 2. Draw particles colored by density or pressure
-       // Low value = blue, high value = red
-       for (int i = 0; i < particles.Length; i++)
-       {
-           float value = showPressureColor ? particles[i].pressure : particles[i].density;
-           float maxValue = showPressureColor ? stiffness * (restDensity * 0.5f) : restDensity * 1.5f;
-           float t = Mathf.InverseLerp(0f, maxValue, value);
-           Gizmos.color = Color.Lerp(Color.blue, Color.red, t);
-           Gizmos.DrawSphere(new Vector3(particles[i].position.x, particles[i].position.y, 0f), 0.08f);
-       }
-
-       // 3. Force arrows
-       // Direction = force direction. Color = force magnitude (weak -> strong)
-       if (showViscosityArrows && viscosityForces != null)
-       {
-           float maxVisc = 1e-6f;
-           for (int i = 0; i < viscosityForces.Length; i++)
-           {
-               float mag = viscosityForces[i].magnitude;
-               if (mag > maxVisc) maxVisc = mag;
-           }
-
-           for (int i = 0; i < viscosityForces.Length; i++)
-           {
-               Vector2 vf = viscosityForces[i];
-               float mag = vf.magnitude;
-               if (mag < 1e-6f) continue;
-
-               Vector3 viscOrigin = new Vector3(particles[i].position.x, particles[i].position.y, 0f);
-               Vector3 viscDir = new Vector3(vf.x / mag, vf.y / mag, 0f);
-
-               float viscT = Mathf.InverseLerp(0f, maxVisc, mag);
-               Gizmos.color = Color.Lerp(Color.yellow, new Color(1f, 0.35f, 0f), viscT);
-               Gizmos.DrawLine(viscOrigin, viscOrigin + viscDir * forceArrowLength);
-           }
-       }
-       else if (showForceArrows)
-       {
-           float maxForce = 1e-6f;
-           for (int i = 0; i < particles.Length; i++)
-           {
-               float mag = particles[i].force.magnitude;
-               if (mag > maxForce) maxForce = mag;
-           }
-
-           for (int i = 0; i < particles.Length; i++)
-           {
-               Vector2 f = particles[i].force;
-               float mag = f.magnitude;
-               if (mag < 1e-6f) continue;
-
-               Vector3 origin = new Vector3(particles[i].position.x, particles[i].position.y, 0f);
-               Vector3 dir = new Vector3(f.x / mag, f.y / mag, 0f);
-
-               float magT = Mathf.InverseLerp(0f, maxForce, mag);
-               Gizmos.color = Color.Lerp(Color.cyan, Color.magenta, magT);
-               Gizmos.DrawLine(origin, origin + dir * forceArrowLength);
-           }
-       }                                                                          
-                                                                                  
-       // DEBUG: draw only one debug particle and its neighbors
-       // Purpose: lets you see which particle owns which neighbor connections
-       List<int>[] debugNeighbors = grid.FluidNeighbors;
-
-       if (debugNeighbors != null && debugNeighbors.Length > 0)
-       {
-           int target = Mathf.Clamp(debugParticle, 0, particles.Length - 1);
-
-           // Highlight debug particle in red
-           Gizmos.color = Color.red;
-           Gizmos.DrawWireSphere(
-               new Vector3(particles[target].position.x, particles[target].position.y, 0f),
-               0.12f
-           );
-
-           // Draw lines from debug particle to its neighbors in green
-           Gizmos.color = Color.green;
-           for (int j = 0; j < debugNeighbors[target].Count; j++)
-           {
-               int neighborIndex = debugNeighbors[target][j];
-               Gizmos.DrawLine(
-                   new Vector3(particles[target].position.x, particles[target].position.y, 0f),
-                   new Vector3(particles[neighborIndex].position.x, particles[neighborIndex].position.y, 0f)
-               );
-           }
-       }                                                                          
-}                                                                                   
 }
