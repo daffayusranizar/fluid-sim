@@ -17,25 +17,33 @@ public class SPH2D : MonoBehaviour
 
     public Vector2Int numToSpawn = new Vector2Int(20, 20);
 
-    // Gravity is disabled for now so the pressure force can be observed on its own.
-    // Set it back to (0, -9.81) to bring gravity back.
-    public Vector2 gravity = new Vector2(0f, 0f);
+    public Vector2 gravity = new Vector2(0f, -9.81f);
     public float collisionDamping = 0.5f;
 
-    public float smoothingLength = 2f;
+    // h is derived at spawn as h = smoothingLengthInSpacing * particle spacing.
+    // Deriving it keeps the neighbour count in a sane range no matter how many
+    // particles there are or how large the spawn region is.
+    public float smoothingLengthInSpacing = 2.2f;
+    [HideInInspector] public float smoothingLength = 2f;
+
     public int debugParticle = 0;
 
     [Header("Simulation")]
-    public int subSteps = 8;
+    public int maxSubSteps = 32;
+    [Range(0.05f, 0.5f)] public float cflFactor = 0.25f;
+    public float minTimeStep = 0.0002f;
+    public float maxTimeStep = 0.02f;
 
     [Header("Spawn")]
-    [Range(0.05f, 1f)] public float spawnAreaFraction = 0.4f;
-    public Vector2 spawnRegionCenter = Vector2.zero;
+    // Fraction of boxSize the fluid starts in, per axis. The classic dam break is
+    // a tall column: narrow in x, full height in y.
+    public Vector2 spawnRegionSize = new Vector2(0.3f, 0.8f);
+    public Vector2 spawnRegionCenter = new Vector2(-1f, 0f);
 
     [Header("Density")]
     public float restDensity = 1000f;
     public bool autoParticleMass = true;
-    public float spawnCompression = 1.3f;
+    public float spawnCompression = 1f;
     public float particleMass = 1f;
 
     [Header("Pressure")]
@@ -68,6 +76,8 @@ public class SPH2D : MonoBehaviour
     private Vector2[] boundaryParticles;
     private float boundaryVolume;
     private float spawnSpacing = 1f;
+    private float timeAccumulator;
+    private float lastStepSize;
 
     private Mesh heatMapMesh;
     private Material heatMapMaterial;
@@ -132,12 +142,16 @@ public class SPH2D : MonoBehaviour
         // A uniform density field has zero pressure gradient, and force comes from
         // the gradient -- so filling the whole canvas leaves the fluid jammed
         // against the walls with nothing to do. Packing it into part of the canvas
-        // gives it room to expand into, which is what produces visible flow.
+        // gives it room to move into, which is what produces visible flow.
         Vector2 canvasCenter = transform.position;
 
-        float fraction = Mathf.Clamp(spawnAreaFraction, 0.05f, 1f);
-        float linearScale = Mathf.Sqrt(fraction);
-        Vector2 regionSize = new Vector2(boxSize.x * linearScale, boxSize.y * linearScale);
+        Vector2 sizeFraction = new Vector2(
+            Mathf.Clamp(spawnRegionSize.x, 0.02f, 1f),
+            Mathf.Clamp(spawnRegionSize.y, 0.02f, 1f));
+
+        Vector2 regionSize = new Vector2(
+            boxSize.x * sizeFraction.x,
+            boxSize.y * sizeFraction.y);
 
         // Move the region while keeping it fully inside the container.
         // spawnRegionCenter is in -1..1: (-1,-1) is one corner, (0,0) centred.
@@ -150,6 +164,11 @@ public class SPH2D : MonoBehaviour
         float area = regionSize.x * regionSize.y;
         float nominalSpacing = Mathf.Sqrt(area / Mathf.Max(1, TotalParticles));
         spawnSpacing = nominalSpacing;
+
+        // Derive the smoothing length from the packing so the neighbour count is
+        // consistent regardless of particle count or spawn region size.
+        smoothingLength = smoothingLengthInSpacing * nominalSpacing;
+
         float minDist = nominalSpacing * 0.85f;
         float minDistSq = minDist * minDist;
         const int maxAttempts = 30;
@@ -193,14 +212,22 @@ public class SPH2D : MonoBehaviour
     {
         if (particles == null)
             return;
-        
-        // Run the solver in small substeps so explicit integration stays stable.
-        // The whole solver still advances by Time.deltaTime per frame in total.
-        int steps = Mathf.Max(1, subSteps);
-        float dt = Time.deltaTime / steps;
 
-        for (int s = 0; s < steps; s++)
+        // Frame time goes into a buffer rather than straight into the integrator.
+        // The solver then consumes it in steps small enough to stay stable, so a
+        // slow frame produces more steps instead of one large unstable step.
+        timeAccumulator += Time.deltaTime;
+
+        int steps = 0;
+
+        while (timeAccumulator > 0f && steps < maxSubSteps)
         {
+            // Size the step from the current state, then never step past the
+            // remaining budget so the simulation stays in sync with real time.
+            float dt = Mathf.Clamp(ComputeStableTimeStep(), minTimeStep, maxTimeStep);
+            dt = Mathf.Min(dt, timeAccumulator);
+            lastStepSize = dt;
+
             FindNeighbors();
             ComputeDensity();
             ComputePressure();
@@ -210,20 +237,66 @@ public class SPH2D : MonoBehaviour
             ComputePressureForce();
             ComputeViscosityForce();
 
-            // TEMPORARY integration + wall clamp so you can see motion now.
-            // Proper versions arrive in T-020 (boundaries) and T-021 (integration scheme).
             Integrate(dt);
+
+            timeAccumulator -= dt;
+            steps++;
         }
+
+        // Drop any backlog. A long hitch must not put the solver into a spiral of
+        // death where it falls further behind the frame rate every frame.
+        timeAccumulator = 0f;
 
         // DEBUG: log density/pressure per particle so you can verify the Tait EOS
         if (debugLogs)
         {
+            Debug.Log($"steps={steps}, dt={lastStepSize:F5}");
+
             for (int i = 0; i < particles.Length; i++)
             {
                 Debug.Log($"Particle {i}: density={particles[i].density:F2}, pressure={particles[i].pressure:F2}");
             }
         }
 
+    }
+
+    // Largest step that keeps the explicit integration stable.
+    //
+    // CFL limit: information must not travel further than one smoothing length per
+    // step, so dt <= C * h / (maxSpeed + soundSpeed). The sound speed comes from the
+    // equation of state: with p = k(rho - rho0) we have dp/drho = k, so c = sqrt(k).
+    // A stiffer fluid therefore forces a smaller step -- this is the price of
+    // weak compressibility.
+    //
+    // Acceleration limit: a particle must not be flung across its own
+    // neighbourhood within a single step.
+    private float ComputeStableTimeStep()
+    {
+        float h = smoothingLength;
+        float soundSpeed = Mathf.Sqrt(Mathf.Max(0f, stiffness));
+
+        float maxSpeed = 0f;
+        float maxAccel = 0f;
+
+        for (int i = 0; i < particles.Length; i++)
+        {
+            float speed = particles[i].velocity.magnitude;
+            if (speed > maxSpeed) maxSpeed = speed;
+
+            if (particles[i].density > 0.0001f)
+            {
+                float accel = (particles[i].force / particles[i].density + gravity).magnitude;
+                if (accel > maxAccel) maxAccel = accel;
+            }
+        }
+
+        float dtCfl = cflFactor * h / (maxSpeed + soundSpeed + 0.0001f);
+
+        float dtAcc = maxAccel > 0.0001f
+            ? cflFactor * Mathf.Sqrt(h / maxAccel)
+            : float.MaxValue;
+
+        return Mathf.Min(dtCfl, dtAcc);
     }
 
     private void FindNeighbors()
@@ -492,8 +565,14 @@ public class SPH2D : MonoBehaviour
 
     private int HeatMapResolutionClamped => Mathf.Clamp(heatMapResolution, 2, 512);
 
-    // TEMPORARY: semi-implicit Euler with a simple wall clamp.
-    // T-020 will replace the boundary handling and T-021 the integration scheme.
+    // Semi-implicit (symplectic) Euler. Velocity is updated first, then position
+    // uses the NEW velocity, which damps energy instead of injecting it -- that is
+    // what makes this scheme usable for stiff pressure forces.
+    //
+    // The wall clamp here is now only a penetration safety net. The physics of the
+    // wall is handled by the boundary particles in ComputeDensity and
+    // ComputePressureForce; this just guarantees a particle can never escape if a
+    // step does overshoot.
     private void Integrate(float dt)
     {
         Vector2 center = transform.position;
