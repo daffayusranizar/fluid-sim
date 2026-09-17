@@ -120,9 +120,28 @@ Task Code: T-022
 
 ---
 
+## Phase 1 Invariants — Do Not Silently Regress These
+
+Phase 1 produced several behaviours that the later phases must preserve. Phases 2–4 are *performance* work; they are not licence to change physics. Each item below is easy to drop by omission, because the optimisation tasks never mention it.
+
+| Invariant | Where it lives now | Where it is at risk |
+|---|---|---|
+| **Boundary particles** complete the kernel support near walls and push back via pressure mirroring (`p_b = p_i`). This is what stops particles welding to walls. | `SpawnBoundaryParticles()`, `ComputeDensity()`, `ComputePressureForce()` | T-023 (grid must index them), T-026–T-028 (must be ported) |
+| **Viscosity** is the only dissipative term. Without it the fluid sloshes forever. | `ComputeViscosityForce()` | T-028 (must be ported to HLSL) |
+| **Pressure clamping** (`p = max(0, k(ρ−ρ₀))`) is deliberate. Unclamping reintroduces the tensile instability. | `ComputePressure()` | T-027 (must be ported into the EOS) |
+| **Adaptive CFL step size** derived from `c_s = √stiffness`, max velocity and max acceleration. | `ComputeStableTimeStep()` | T-029 (conflicts with "zero CPU readback") |
+| **Auto-calibrated particle mass** so mean spawn density matches `restDensity`. | `CalibrateParticleMass()` | Any phase that changes spawn or resolution |
+| **Smoothing length derived from spacing** (`h = 2.2 × spacing`), not hand-set. | `SpawnParticles()` | Any phase that changes particle count |
+
+**Rule:** if a later task must change one of these, record the decision and the reason in that task. Do not let it change by omission.
+
+---
+
 ## Phase 2: CPU Optimization (T-023 to T-025)
 
 Your brute-force solver works. Now make it faster while keeping the same behavior.
+
+> **"The same behavior" is load-bearing.** Phase 2 is a pure performance refactor. In particular, boundary particles must remain part of the neighbour structure — see the Phase 1 Invariants above.
 
 ### Phase Summary
 Replace the O(N²) neighbor search with an O(N) spatial grid. Use Unity's Burst compiler and Job System to parallelize the computation.
@@ -134,7 +153,8 @@ Replace the O(N²) neighbor search with an O(N) spatial grid. Use Unity's Burst 
 Task Code: T-023
 * Quest : Replace brute-force neighbor search with a uniform spatial grid (also called spatial hashing or cell-based neighbor search).
 * Guide : Divide the simulation domain into cells of size h (the smoothing radius). For each particle, compute its cell coordinate (floor(x/h), floor(y/h)). Only check neighbors in the 9 surrounding cells. Study spatial grid theory: why it's O(N), how cell size relates to h, and what happens at cell boundaries.
-* Done : Neighbor search is O(N) instead of O(N²). You can increase particle count to 500+ and still run at 60 FPS.
+* Constraint : The grid must index **boundary particles as well as fluid particles**. If it only indexes fluid particles, wall behaviour regresses *here*, silently breaking Phase 2's "same behavior" promise. Boundary particles are static, so their cell membership never changes and can be computed once at spawn — decide up front whether they share the fluid grid or get their own static grid.
+* Done : Neighbor search is O(N) instead of O(N²). You can increase particle count to 500+ and still run at 60 FPS. Wall behaviour is unchanged from T-022.
 
 Task Code: T-024
 * Quest : Integrate Unity's Burst compiler to speed up the CPU SPH loop.
@@ -155,6 +175,8 @@ The CPU solver is fast enough for moderate particle counts. Now move the heavy m
 ### Phase Summary
 Use Unity Compute Shaders to run SPH kernels on the GPU. This works on macOS via the Metal backend.
 
+**Decide before starting.** The CPU solver depends on boundary particles (T-020) and an adaptive CFL step size (T-021). Neither appears in the tasks below, so both will be dropped by default unless handled deliberately. See **GPU Port Decisions** at the end of this phase.
+
 - [ ] T-026 — Compute Shader Setup & Data Flow
 - [ ] T-027 — GPU Density & Pressure Kernels
 - [ ] T-028 — GPU Force Computation & Integration
@@ -163,22 +185,41 @@ Use Unity Compute Shaders to run SPH kernels on the GPU. This works on macOS via
 Task Code: T-026
 * Quest : Set up a Compute Shader pipeline. Create SPH2D.compute, define GPU buffers for particle data, and dispatch a simple kernel from C#.
 * Guide : Study Unity's Compute Shader introduction. Create a compute shader with a single kernel that reads and writes particle positions. In C#, allocate ComputeBuffer objects, set them via SetBuffer(), and dispatch with Dispatch(). Verify data round-trips correctly between CPU and GPU.
+* Constraint : Particle buffers must be able to hold boundary particles too. They are static — uploaded once, never updated, never integrated — and `boundaryVolume` is a single scalar. So this costs one buffer and one shader constant, not a whole new subsystem.
 * Done : You can execute a compute shader from C# and read back modified particle data. The basic CPU-GPU communication pipeline works.
 
 Task Code: T-027
 * Quest : Implement density and pressure computation entirely in the compute shader.
 * Guide : Write HLSL functions for the 2D Poly6 kernel and Tait EOS. Implement a kernel that loops over all particles and computes density + pressure for each. Store results in RWStructuredBuffer<float> for densities and pressures. Study HLSL syntax differences from C# (float2, [numthreads], thread IDs).
+* Constraint : The density kernel must include the boundary contribution `restDensity * boundaryVolume * W`, exactly as `ComputeDensity()` does on the CPU. Without it, density near walls is under-estimated and the T-020 wall-welding bug returns on the GPU. Also port the pressure clamp (`p = max(0, p)`) — it is deliberate, not a leftover.
 * Done : Density and pressure are computed on the GPU. Values match your CPU implementation for the same input data.
 
 Task Code: T-028
 * Quest : Implement pressure and viscosity force computation in the compute shader.
 * Guide : Write HLSL functions for the Spiky gradient and Viscosity Laplacian. Create a force computation kernel that reads positions, densities, and pressures, then writes force vectors to a RWStructuredBuffer<float2>. Study how to structure multi-pass compute shader pipelines.
+* Constraint : Two things must be carried over. (1) The boundary push via pressure mirroring — on the CPU this collapses to `V_b * p_i * |gradW_spiky|` with the direction pointing inward. (2) The viscosity term — it is the only dissipative force in the solver, so omitting it produces a fluid that never settles.
 * Done : All SPH forces are computed on the GPU. The visual result matches the CPU solver.
 
 Task Code: T-029
 * Quest : Integrate the GPU compute pipeline with your C# simulation loop with zero CPU readback during simulation.
 * Guide : Keep particle state entirely on the GPU between frames. Only read back data for visualization if needed. Use ComputeBuffer.CopyCount() or similar for metadata. Study the trade-offs of keeping data on GPU vs. CPU. On macOS, verify the Metal backend compiles and runs your compute shaders.
+* Constraint : "Zero CPU readback" conflicts with T-021's adaptive step size, which needs `max‖v‖` and `max‖a‖` from the GPU. Choose deliberately: **(a)** GPU parallel reduction plus one tiny async readback consumed a frame later (no pipeline stall), **(b)** keep `dt` GPU-resident so the CPU never sees it, or **(c)** fall back to a fixed conservative `dt` and accept the lost adaptivity. Do not let the step silently become fixed.
 * Done : The full SPH simulation runs on GPU. CPU only handles dispatch and rendering. You can reach 10,000+ particles at interactive frame rates.
+
+---
+
+### GPU Port Decisions
+
+Record the outcome of each decision as you make it. The point is that these are **choices**, not accidents.
+
+| # | Decision | Options | Chosen | Reason |
+|---|---|---|---|---|
+| 1 | Boundary particles in the spatial grid (T-023) | shared grid / separate static grid / exclude | | |
+| 2 | Boundary particles on GPU (T-026) | port to a static buffer / drop and rely on the clamp | | |
+| 3 | Boundary push on GPU (T-028) | pressure mirroring / penalty force / none | | |
+| 4 | Adaptive step under zero readback (T-029) | async readback / GPU-resident dt / fixed dt | | |
+
+**Recommended baseline:** port the boundary particles — they are static, so they are cheap — and keep the step adaptive via a GPU reduction. Dropping boundary particles does not merely reduce fidelity; it reintroduces the exact wall-welding bug that T-020 fixed, in the phase where it is hardest to diagnose.
 
 ---
 
