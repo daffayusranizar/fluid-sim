@@ -151,8 +151,10 @@ Replace the O(N²) neighbor search with an O(N) spatial grid. Use Unity's Burst 
 - [ ] T-025 — Unity Job System Parallelization
 
 Task Code: T-023
-* Quest : Replace brute-force neighbor search with a uniform spatial grid (also called spatial hashing or cell-based neighbor search).
+* Quest : Replace brute-force neighbor search with a uniform spatial grid.
 * Guide : Divide the simulation domain into cells of size h (the smoothing radius). For each particle, compute its cell coordinate (floor(x/h), floor(y/h)). Only check neighbors in the 9 surrounding cells. Study spatial grid theory: why it's O(N), how cell size relates to h, and what happens at cell boundaries.
+* Note : A uniform grid and spatial **hashing** are not the same thing. This task uses a uniform grid with **direct index arithmetic**, because the domain is a bounded box: no collisions, O(1) lookup. Hashing exists to represent *unbounded* domains and pays for that with collisions — the prime-multiplier hash belongs in T-030, where the GPU path does need it. Measured on a bounded domain, spatial hashing was the slowest of five methods tested (Ihmsen et al. 2011, Table 2).
+* Note : Cell size must be exactly h. Measured (Ihmsen et al. 2011, Table 4): halving the cell size to 0.5h tests fewer pairs (15.5M vs 25M) but takes *longer* (39.6ms vs 26.6ms), because more cells means more memory lookups. Smaller is not better.
 * Constraint : The grid must index **boundary particles as well as fluid particles**. If it only indexes fluid particles, wall behaviour regresses *here*, silently breaking Phase 2's "same behavior" promise. Boundary particles are static, so their cell membership never changes and can be computed once at spawn — decide up front whether they share the fluid grid or get their own static grid.
 * Done : Neighbor search is O(N) instead of O(N²). You can increase particle count to 500+ and still run at 60 FPS. Wall behaviour is unchanged from T-022.
 

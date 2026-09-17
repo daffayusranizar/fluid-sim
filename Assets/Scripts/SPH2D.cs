@@ -60,7 +60,7 @@ public class SPH2D : MonoBehaviour
     [Range(0f, 1f)] public float heatMapOpacity = 0.6f;
 
     private Particle2D[] particles;
-    private List<int>[] neighbors;
+    private SPHGrid grid = new SPHGrid();
 
     private Vector2[] viscosityForces;
     private Vector2[] boundaryParticles;
@@ -291,73 +291,57 @@ public class SPH2D : MonoBehaviour
 
     private void FindNeighbors()
     {
-        int n = particles.Length;                                                 
-                                                                                 
-       neighbors = new List<int>[n];                                             
-                                                                                 
-       for (int i = 0; i < n; i++)                                               
-       {                                                                         
-           neighbors[i] = new List<int>();                                       
-                                                                                 
-           for (int j = 0; j < n; j++)                                           
-           {                                                                      
-               if (i == j) continue;                                              
-                                                                                  
-               float dist = Vector2.Distance(particles[i].position, particles[j].position);                                                         
-                                                                                  
-               if (dist < smoothingLength)                                       
-               {                                                                 
-                   neighbors[i].Add(j);                                          
-               }                                                                 
-           }                                                                     
-       }                                                                         
-                                                                                  
-       // DEBUG: log neighbor count per particle so you can verify neighbor search is working
-       if (debugLogs)
-       {
-           for (int i = 0; i < n; i++)
-           {
-               Debug.Log($"Particle {i}: {neighbors[i].Count} neighbors");
-           }
-       }                                                                         
-    }    
+        // The grid must cover the container plus one smoothing length of margin,
+        // because boundary particles sit just outside the walls.
+        float margin = smoothingLength * 1.01f;
+        Vector2 domainSize = boxSize + new Vector2(2f * margin, 2f * margin);
+        Vector2 domainOrigin = (Vector2)transform.position - domainSize * 0.5f;
+
+        grid.Rebuild(particles, boundaryParticles, domainOrigin, domainSize, smoothingLength);
+
+        if (debugLogs)
+        {
+            for (int i = 0; i < particles.Length; i++)
+            {
+                Debug.Log($"Particle {i}: {grid.FluidNeighbors[i].Count} fluid, " +
+                          $"{grid.BoundaryNeighbors[i].Count} boundary");
+            }
+        }
+    }
 
     private void ComputeDensity()
     {
         float h2 = smoothingLength * smoothingLength;
         float poly6Const = 4f / (Mathf.PI * Mathf.Pow(smoothingLength, 8f));
 
+        List<int>[] fluidNeighbors = grid.FluidNeighbors;
+        List<int>[] boundaryNeighbors = grid.BoundaryNeighbors;
+
         for (int i = 0; i < particles.Length; i++)
         {
+            Vector2 posI = particles[i].position;
             float density = 0f;
 
-            // Fluid neighbours
-            for (int j = 0; j < neighbors[i].Count; j++)
+            // Fluid neighbours. The grid already rejected anything beyond h,
+            // so no distance test is needed beyond unpacking the squared range.
+            for (int j = 0; j < fluidNeighbors[i].Count; j++)
             {
-                int n = neighbors[i][j];
-                float r = Vector2.Distance(particles[i].position, particles[n].position);
-
-                if (r > 0f && r < smoothingLength)
-                {
-                    float diff = h2 - r * r;
-                    density += particleMass * poly6Const * diff * diff * diff;
-                }
+                int n = fluidNeighbors[i][j];
+                float r2 = (particles[n].position - posI).sqrMagnitude;
+                float diff = h2 - r2;
+                density += particleMass * poly6Const * diff * diff * diff;
             }
 
             // Boundary particles stand for solid material just beyond the wall.
             // Near a wall roughly half the kernel support lies inside the solid, so
             // without these contributions the density is badly under-estimated and
             // the pressure that should push the fluid off the wall never appears.
-            if (useBoundaryParticles && boundaryParticles != null)
+            for (int b = 0; b < boundaryNeighbors[i].Count; b++)
             {
-                for (int b = 0; b < boundaryParticles.Length; b++)
-                {
-                    float r2 = (boundaryParticles[b] - particles[i].position).sqrMagnitude;
-                    if (r2 >= h2) continue;
-
-                    float diff = h2 - r2;
-                    density += restDensity * boundaryVolume * poly6Const * diff * diff * diff;
-                }
+                Vector2 boundaryPos = boundaryParticles[boundaryNeighbors[i][b]];
+                float r2 = (boundaryPos - posI).sqrMagnitude;
+                float diff = h2 - r2;
+                density += restDensity * boundaryVolume * poly6Const * diff * diff * diff;
             }
 
             particles[i].density = density;
@@ -389,23 +373,27 @@ public class SPH2D : MonoBehaviour
         // It stays non-zero at r = 0, which is what keeps particles from overlapping.
         float spikyGradMag = 30f / (Mathf.PI * Mathf.Pow(h, 5f));
 
+        List<int>[] fluidNeighbors = grid.FluidNeighbors;
+        List<int>[] boundaryNeighbors = grid.BoundaryNeighbors;
+
         for (int i = 0; i < particles.Length; i++)
         {
-            for (int j = 0; j < neighbors[i].Count; j++)
+            Vector2 posI = particles[i].position;
+
+            for (int j = 0; j < fluidNeighbors[i].Count; j++)
             {
-                int n = neighbors[i][j];
+                int n = fluidNeighbors[i][j];
 
                 // Guard against zero density from isolated particles
                 if (particles[n].density <= 0.0001f) continue;
 
                 // Points from neighbor j to particle i
-                Vector2 rVec = particles[i].position - particles[n].position;
-                float r = rVec.magnitude;
+                Vector2 rVec = posI - particles[n].position;
+                float r2 = rVec.sqrMagnitude;
+                if (r2 <= 0f) continue;
 
-                if (r <= 0f || r >= h) continue;
-
+                float r = Mathf.Sqrt(r2);
                 Vector2 dir = rVec / r;
-
                 float hr = h - r;
 
                 // Muller Eqn (10): m_j * (p_i + p_j) / (2 rho_j) * gradW_spiky
@@ -422,25 +410,22 @@ public class SPH2D : MonoBehaviour
 
             // Boundary particles push back using this fluid particle's own pressure
             // (pressure mirroring), which is what enforces no-penetration at the wall.
-            if (useBoundaryParticles && boundaryParticles != null)
+            float pressure = particles[i].pressure;
+
+            for (int b = 0; b < boundaryNeighbors[i].Count; b++)
             {
-                float pressure = particles[i].pressure;
+                // Points from the boundary particle to the fluid particle (inward)
+                Vector2 rVec = posI - boundaryParticles[boundaryNeighbors[i][b]];
+                float r2 = rVec.sqrMagnitude;
+                if (r2 <= 0f) continue;
 
-                for (int b = 0; b < boundaryParticles.Length; b++)
-                {
-                    // Points from the boundary particle to the fluid particle (inward)
-                    Vector2 rVec = particles[i].position - boundaryParticles[b];
-                    float r2 = rVec.sqrMagnitude;
-                    if (r2 <= 0f || r2 >= h * h) continue;
+                float r = Mathf.Sqrt(r2);
+                Vector2 dir = rVec / r;
+                float hr = h - r;
 
-                    float r = Mathf.Sqrt(r2);
-                    Vector2 dir = rVec / r;
-                    float hr = h - r;
-
-                    // m_b = restDensity * V_b, and mirroring gives p_b = p_i and
-                    // rho_b = restDensity, so the coefficient collapses to V_b * p_i.
-                    particles[i].force += dir * (boundaryVolume * pressure * spikyGradMag * hr * hr);
-                }
+                // m_b = restDensity * V_b, and mirroring gives p_b = p_i and
+                // rho_b = restDensity, so the coefficient collapses to V_b * p_i.
+                particles[i].force += dir * (boundaryVolume * pressure * spikyGradMag * hr * hr);
             }
         }
     }
@@ -472,25 +457,28 @@ public class SPH2D : MonoBehaviour
             viscosityForces = new Vector2[particles.Length];
         }
 
+        List<int>[] fluidNeighbors = grid.FluidNeighbors;
+
         for (int i = 0; i < particles.Length; i++)
         {
+            Vector2 posI = particles[i].position;
+            Vector2 velI = particles[i].velocity;
             Vector2 viscForce = Vector2.zero;
 
-            for (int j = 0; j < neighbors[i].Count; j++)
+            for (int j = 0; j < fluidNeighbors[i].Count; j++)
             {
-                int n = neighbors[i][j];
+                int n = fluidNeighbors[i][j];
 
                 if (particles[n].density <= 0.0001f) continue;
 
-                float r = Vector2.Distance(particles[i].position, particles[n].position);
-                if (r >= h) continue;
+                float r = Mathf.Sqrt((particles[n].position - posI).sqrMagnitude);
 
                 // Muller Eqn (14): mu * m_j * (v_j - v_i) / rho_j * laplacian(W_visc)
                 // The direction lives in (v_j - v_i), so the force always pulls this
                 // particle's velocity toward the neighbour's.
                 viscForce += viscosity
                              * particleMass
-                             * (particles[n].velocity - particles[i].velocity)
+                             * (particles[n].velocity - velI)
                              / particles[n].density
                              * viscLapMag * (h - r);
             }
@@ -867,7 +855,9 @@ public class SPH2D : MonoBehaviour
                                                                                   
        // DEBUG: draw only one debug particle and its neighbors
        // Purpose: lets you see which particle owns which neighbor connections
-       if (neighbors != null && neighbors.Length > 0)
+       List<int>[] debugNeighbors = grid.FluidNeighbors;
+
+       if (debugNeighbors != null && debugNeighbors.Length > 0)
        {
            int target = Mathf.Clamp(debugParticle, 0, particles.Length - 1);
 
@@ -880,9 +870,9 @@ public class SPH2D : MonoBehaviour
 
            // Draw lines from debug particle to its neighbors in green
            Gizmos.color = Color.green;
-           for (int j = 0; j < neighbors[target].Count; j++)
+           for (int j = 0; j < debugNeighbors[target].Count; j++)
            {
-               int neighborIndex = neighbors[target][j];
+               int neighborIndex = debugNeighbors[target][j];
                Gizmos.DrawLine(
                    new Vector3(particles[target].position.x, particles[target].position.y, 0f),
                    new Vector3(particles[neighborIndex].position.x, particles[neighborIndex].position.y, 0f)
