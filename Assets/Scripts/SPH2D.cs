@@ -1,16 +1,6 @@
 using UnityEngine;
 using System.Collections.Generic;
 
-
-public struct Particle2D
-{
-    public Vector2 position;
-    public Vector2 velocity;
-    public Vector2 force;
-    public float density;
-    public float pressure;
-}
-
 public class SPH2D : MonoBehaviour
 {
     public Vector2 boxSize = new Vector2(20f, 20f);
