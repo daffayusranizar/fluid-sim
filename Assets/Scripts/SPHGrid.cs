@@ -108,7 +108,7 @@ public struct SPHGrid : IDisposable
 
         SPHGridOps.BuildCells(
             positions, boundary,
-            packedCell, cellStart, cellCursor, sortedByCell,
+            ref packedCell, ref cellStart, ref cellCursor, ref sortedByCell,
             geometry, fluidCount, boundaryCount, totalCount);
 
         // Count neighbours, then turn the counts into start offsets.
@@ -116,7 +116,7 @@ public struct SPHGrid : IDisposable
         SPHGridOps.CountNeighbors(
             positions, boundary,
             sortedByCell, cellStart,
-            fluidStart, boundaryStart,
+            ref fluidStart, ref boundaryStart,
             geometry, fluidCount, totalCount, radiusSq);
 
         PrefixSum(fluidStart, fluidCount);
@@ -127,8 +127,8 @@ public struct SPHGrid : IDisposable
         SPHGridOps.FillNeighbors(
             positions, boundary,
             sortedByCell, cellStart,
-            fluidStart, fluidList,
-            boundaryStart, boundaryList,
+            fluidStart, ref fluidList,
+            boundaryStart, ref boundaryList,
             geometry, fluidCount, radiusSq);
 
         return new NeighborLists
@@ -260,10 +260,10 @@ public static class SPHGridOps
     public static void BuildCells(
         in NativeArray<float2> positions,
         in NativeArray<float2> boundary,
-        NativeArray<int> packedCell,
-        NativeArray<int> cellStart,
-        NativeArray<int> cellCursor,
-        NativeArray<int> sortedByCell,
+        ref NativeArray<int> packedCell,
+        ref NativeArray<int> cellStart,
+        ref NativeArray<int> cellCursor,
+        ref NativeArray<int> sortedByCell,
         in GridGeometry g,
         int fluidCount,
         int boundaryCount,
@@ -318,8 +318,8 @@ public static class SPHGridOps
         in NativeArray<float2> boundary,
         in NativeArray<int> sortedByCell,
         in NativeArray<int> cellStart,
-        NativeArray<int> fluidStart,
-        NativeArray<int> boundaryStart,
+        ref NativeArray<int> fluidStart,
+        ref NativeArray<int> boundaryStart,
         in GridGeometry g,
         int fluidCount,
         int totalCount,
@@ -377,9 +377,9 @@ public static class SPHGridOps
         in NativeArray<int> sortedByCell,
         in NativeArray<int> cellStart,
         in NativeArray<int> fluidStart,
-        NativeArray<int> fluidList,
+        ref NativeArray<int> fluidList,
         in NativeArray<int> boundaryStart,
-        NativeArray<int> boundaryList,
+        ref NativeArray<int> boundaryList,
         in GridGeometry g,
         int fluidCount,
         float radiusSq)
@@ -435,7 +435,7 @@ public static class SPHGridOps
 
     /// <summary>Cell index of a position, clamped into the grid.</summary>
     [BurstCompile]
-    public static int CellOf(float2 position, in GridGeometry g)
+    public static int CellOf(in float2 position, in GridGeometry g)
     {
         return RowOf(position.y, g) * g.cols + ColumnOf(position.x, g);
     }

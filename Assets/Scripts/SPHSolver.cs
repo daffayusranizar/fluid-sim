@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using Unity.Burst;
 using Unity.Collections;
 using Unity.Mathematics;
@@ -27,7 +28,12 @@ public struct SolverParams
     public float restDensity;
     public float particleMass;
     public float stiffness;
-    public bool clampPressurePositive;
+
+    // Burst cannot pass a plain bool through a direct-call function pointer: a bool
+    // has no fixed size in the CLR. Marshalling it as one byte makes the struct
+    // blittable so the [BurstCompile] direct calls can be compiled instead of
+    // silently falling back to managed code.
+    [MarshalAs(UnmanagedType.U1)] public bool clampPressurePositive;
 
     // --- Near pressure (double density relaxation) ---
     public float nearPressureMultiplier;
@@ -37,7 +43,7 @@ public struct SolverParams
 
     // --- Boundary particles ---
     public float boundaryVolume;
-    public bool useBoundaryParticles;
+    [MarshalAs(UnmanagedType.U1)] public bool useBoundaryParticles;
 
     // --- Container and integration ---
     public float2 gravity;
