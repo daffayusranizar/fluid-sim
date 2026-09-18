@@ -67,6 +67,7 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="Assets/TutorialInfo/StyleSheets/ReadmeEditor.uss" />
+    <None Include="Assets/Shaders/FluidSurface.shader" />
     <None Include="Assets/Shaders/Particle2D.shader" />
     <None Include="Assets/TutorialInfo/StyleSheets/ReadmeEditorLight.uss" />
     <None Include="Assets/Shaders/SPH2D.compute" />
