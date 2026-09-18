@@ -211,7 +211,7 @@ MonoBehaviour:
   gpuSource: {fileID: 143382747}
   particleRadius: 0.12
   autoParticleRadius: 1
-  particleRadiusInSpacing: 1.7
+  particleRadiusInSpacing: 0.8
   velocityDisplayMax: 6
   preset: 5
   colourMap:

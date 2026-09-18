@@ -63,10 +63,11 @@ public class ParticleRenderer2D : MonoBehaviour
     public bool autoParticleRadius = true;
 
     [Tooltip("Impostor radius per unit of particle spacing. The world-space disc " +
-             "radius is half of this. 1.7 makes neighbouring discs overlap by about " +
-             "the spacing, which is what reads as a continuous body rather than " +
-             "as circles that happen to touch.")]
-    public float particleRadiusInSpacing = 1.7f;
+             "radius is HALF of this, so a value of 0.8 gives discs 0.8 x spacing " +
+             "across. Below ~1.13 the discs leave gaps and read as separate " +
+             "particles; at ~1.13 they just tile the area into one sheet; above " +
+             "that they overlap into a solid mass.")]
+    public float particleRadiusInSpacing = 0.8f;
 
     [Tooltip("Speed mapped to the top of the colour gradient. Particles at or " +
              "above this render as the gradient's final colour. Ignored when " +
