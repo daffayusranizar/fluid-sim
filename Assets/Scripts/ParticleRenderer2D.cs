@@ -1,5 +1,6 @@
 using Unity.Collections;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 /// <summary>
 /// Renders particles as smooth instanced discs instead of gizmos.
@@ -68,6 +69,36 @@ public class ParticleRenderer2D : MonoBehaviour
     [Range(0f, 1f)] public float impostorSpecular = 0.35f;
     public float impostorShininess = 32f;
 
+    [Header("Screen-space surface")]
+    [Tooltip("Render the surface implied by the particle depths instead of the " +
+             "individual discs. Removes the per-disc silhouettes that make a cloud " +
+             "of particles read as dots. Costs an offscreen depth pass, two blur " +
+             "passes and a full-screen composite.")]
+    public bool useScreenSpaceSurface = false;
+
+    [Tooltip("FluidSim/FluidSurface shader. Found automatically when left empty.")]
+    public Shader surfaceShader;
+
+    [Tooltip("Camera the screen-space surface is built for. Falls back to " +
+             "Camera.main, which requires the camera to carry the MainCamera tag.")]
+    public Camera targetCamera;
+
+    [Tooltip("Depth similarity tolerance for the bilateral blur, in world units. " +
+             "Roughly the particle radius: larger blends across the silhouette, " +
+             "smaller leaves disc seams.")]
+    public float surfaceRangeSigma = 0.05f;
+
+    [Range(0f, 1f)] public float surfaceAmbient = 0.35f;
+    [Range(0f, 1f)] public float surfaceSpecular = 0.6f;
+    public float surfaceShininess = 48f;
+
+    [Tooltip("Higher softens the silhouette against the depth jump; 0 leaves it hard.")]
+    public float surfaceEdgeSoftness = 1f;
+
+    [Tooltip("Direction the surface light comes from. Negative Z lights the side " +
+             "facing the camera, which is where the reconstructed normals point.")]
+    public Vector3 surfaceLightDirection = new Vector3(-0.4f, 0.5f, -0.8f);
+
     /// <summary>Bytes per particle. Must match the shader's Particle struct.</summary>
     private const int ParticleStride = sizeof(float) * 10;
 
@@ -81,6 +112,23 @@ public class ParticleRenderer2D : MonoBehaviour
 
     private ComputeBuffer boundBuffer;
     private int boundCount;
+
+    // Screen-space surface resources. Depth is RFloat, not RHalf: the reconstructed
+    // normals come from screen-space derivatives of depth, and half precision at a
+    // camera distance of ~10 quantises in steps of ~0.01, which is a visible
+    // fraction of a particle radius.
+    private const float FarDepth = 512f;
+
+    private RenderTexture depthTarget;
+    private RenderTexture blurTargetA;
+    private RenderTexture blurTargetB;
+    private RenderTexture colourTarget;
+
+    private Material blurMaterial;
+    private Material compositeMaterial;
+    private CommandBuffer surfaceCommands;
+
+    private CommandBuffer SurfaceCommands => surfaceCommands ??= new CommandBuffer { name = "Fluid surface" };
 
     private Texture2D gradientTexture;
 
@@ -175,10 +223,162 @@ public class ParticleRenderer2D : MonoBehaviour
 
         material = new Material(shader);
         quad = CreateQuadMesh();
+
+        if (surfaceShader == null) surfaceShader = Shader.Find("FluidSim/FluidSurface");
+
+        if (surfaceShader != null)
+        {
+            blurMaterial = new Material(surfaceShader) { hideFlags = HideFlags.HideAndDontSave };
+            compositeMaterial = new Material(surfaceShader) { hideFlags = HideFlags.HideAndDontSave };
+            compositeMaterial.renderQueue = (int)RenderQueue.Transparent + 100;
+        }
+    }
+
+    /// <summary>
+    /// Renders the impostors offscreen, blurs their depth, and composites the
+    /// implied surface over the camera.
+    /// </summary>
+    /// <remarks>
+    /// The discs are never drawn to the camera in this mode. They exist only to fill
+    /// the depth and colour targets; what reaches the screen is one full-screen
+    /// quad shaded from the smoothed depth, which is what removes the per-disc
+    /// silhouettes. The full-screen quad is a scene-space rectangle sized to the
+    /// frustum rather than a URP render feature, so the whole effect stays inside
+    /// this component and needs no renderer-asset changes.
+    /// </remarks>
+    private void RenderSurface(ComputeBuffer buffer, int count)
+    {
+        Camera cam = targetCamera != null ? targetCamera : Camera.main;
+        if (cam == null) return;
+
+        if (!EnsureBound(buffer, count)) return;
+        if (needsSettingsUpdate) { needsSettingsUpdate = false; UpdateSettings(); }
+
+        EnsureTargets(cam.pixelWidth, cam.pixelHeight);
+
+        float far = FarDepth;
+        float texelW = 1f / Mathf.Max(1, depthTarget.width);
+        float texelH = 1f / Mathf.Max(1, depthTarget.height);
+        var texelSize = new Vector4(texelW, texelH, depthTarget.width, depthTarget.height);
+
+        // 1. impostors -> depth (min-reduced) and colour, offscreen.
+        // The view/projection matrices are set explicitly: an offscreen command
+        // buffer has no camera context, and the impostor shader derives view depth
+        // from UNITY_MATRIX_V.
+        if (quad == null || material == null || argsBuffer == null)
+        {
+            Debug.LogError($"ParticleRenderer2D.RenderSurface: missing resources " +
+                           $"(quad={quad != null} material={material != null} args={argsBuffer != null}).");
+            return;
+        }
+
+        CommandBuffer commands = SurfaceCommands;
+        commands.Clear();
+        commands.SetViewProjectionMatrices(cam.worldToCameraMatrix, cam.projectionMatrix);
+
+        commands.SetRenderTarget(depthTarget);
+        commands.ClearRenderTarget(false, true, new Color(far, 0f, 0f, 0f));
+        commands.DrawMeshInstancedIndirect(quad, 0, material, 1, argsBuffer);
+
+        commands.SetRenderTarget(colourTarget);
+        commands.ClearRenderTarget(false, true, new Color(0f, 0f, 0f, 0f));
+        commands.DrawMeshInstancedIndirect(quad, 0, material, 0, argsBuffer);
+        Graphics.ExecuteCommandBuffer(commands);
+
+        // 2. bilateral blur, one axis per pass
+        blurMaterial.SetFloat("_FarDepth", far);
+        blurMaterial.SetFloat("_RangeSigma", surfaceRangeSigma);
+        blurMaterial.SetVector("_FluidDepth_TexelSize", texelSize);
+
+        // Explicit pass index: Blit's default (-1) runs more than one pass, which
+        // would composite the surface into the depth target.
+        const int BlurPass = 1;
+
+        blurMaterial.SetTexture("_FluidDepth", depthTarget);
+        blurMaterial.SetVector("_BlurDir", new Vector2(1f, 0f));
+        Graphics.Blit(depthTarget, blurTargetA, blurMaterial, BlurPass);
+
+        blurMaterial.SetTexture("_FluidDepth", blurTargetA);
+        blurMaterial.SetVector("_BlurDir", new Vector2(0f, 1f));
+        Graphics.Blit(blurTargetA, blurTargetB, blurMaterial, BlurPass);
+
+        // 3. composite the surface onto the camera as a frustum-sized quad
+        float distance = cam.nearClipPlane + 0.1f;
+        float halfHeight = cam.orthographic
+            ? cam.orthographicSize
+            : Mathf.Tan(cam.fieldOfView * 0.5f * Mathf.Deg2Rad) * distance;
+        float halfWidth = halfHeight * cam.aspect;
+
+        compositeMaterial.SetFloat("_FarDepth", far);
+        compositeMaterial.SetVector("_FluidDepth_TexelSize", texelSize);
+        compositeMaterial.SetTexture("_FluidDepth", blurTargetB);
+        compositeMaterial.SetTexture("_FluidColour", colourTarget);
+        compositeMaterial.SetVector("_ViewSize", new Vector4(halfWidth * 2f, halfHeight * 2f, 0f, 0f));
+        compositeMaterial.SetVector("_SurfaceLightDir", surfaceLightDirection);
+        compositeMaterial.SetFloat("_SurfaceAmbient", surfaceAmbient);
+        compositeMaterial.SetFloat("_SurfaceSpecular", surfaceSpecular);
+        compositeMaterial.SetFloat("_SurfaceShininess", surfaceShininess);
+        compositeMaterial.SetFloat("_EdgeSoftness", surfaceEdgeSoftness);
+
+        Matrix4x4 trs = Matrix4x4.TRS(
+            cam.transform.position + cam.transform.forward * distance,
+            cam.transform.rotation,
+            new Vector3(halfWidth * 2f, halfHeight * 2f, 1f));
+
+        Graphics.DrawMesh(quad, trs, compositeMaterial, 0);
+    }
+
+    private void EnsureTargets(int width, int height)
+    {
+        width = Mathf.Max(1, width);
+        height = Mathf.Max(1, height);
+
+        if (depthTarget != null && depthTarget.width == width && depthTarget.height == height) return;
+
+        ReleaseTargets();
+
+        depthTarget = new RenderTexture(width, height, 0, RenderTextureFormat.RFloat) { name = "FluidDepth" };
+        blurTargetA = new RenderTexture(width, height, 0, RenderTextureFormat.RFloat) { name = "FluidDepthBlurA" };
+        blurTargetB = new RenderTexture(width, height, 0, RenderTextureFormat.RFloat) { name = "FluidDepthBlurB" };
+        colourTarget = new RenderTexture(width, height, 0, RenderTextureFormat.ARGB32) { name = "FluidColour" };
+
+        foreach (var rt in new[] { depthTarget, blurTargetA, blurTargetB, colourTarget })
+        {
+            rt.filterMode = FilterMode.Bilinear;
+            rt.wrapMode = TextureWrapMode.Clamp;
+            rt.Create();
+        }
+    }
+
+    private void ReleaseTargets()
+    {
+        foreach (var rt in new[] { depthTarget, blurTargetA, blurTargetB, colourTarget })
+        {
+            if (rt == null) continue;
+            rt.Release();
+            if (Application.isPlaying) Destroy(rt); else DestroyImmediate(rt);
+        }
+
+        depthTarget = blurTargetA = blurTargetB = colourTarget = null;
     }
 
     private void OnDestroy()
     {
+        surfaceCommands?.Release();
+        surfaceCommands = null;
+
+        ReleaseTargets();
+
+        if (blurMaterial != null)
+        {
+            if (Application.isPlaying) Destroy(blurMaterial); else DestroyImmediate(blurMaterial);
+        }
+
+        if (compositeMaterial != null)
+        {
+            if (Application.isPlaying) Destroy(compositeMaterial); else DestroyImmediate(compositeMaterial);
+        }
+
         ReleaseBuffer(ref argsBuffer);
         ReleaseBuffer(ref ownParticleBuffer);
 
@@ -215,7 +415,14 @@ public class ParticleRenderer2D : MonoBehaviour
         // uploaded, and the instance count is the solver's capacity.
         if (gpuSource != null && gpuSource.IsReady)
         {
-            Render(gpuSource.ParticleBuffer, gpuSource.ParticleCapacity);
+            if (useScreenSpaceSurface && blurMaterial != null && compositeMaterial != null)
+            {
+                RenderSurface(gpuSource.ParticleBuffer, gpuSource.ParticleCapacity);
+            }
+            else
+            {
+                Render(gpuSource.ParticleBuffer, gpuSource.ParticleCapacity);
+            }
             return;
         }
 
@@ -249,9 +456,14 @@ public class ParticleRenderer2D : MonoBehaviour
     /// traffic. The instance count lives inside the args buffer, which is why it
     /// has to be tracked alongside the binding rather than queried back.
     /// </remarks>
-    private void Render(ComputeBuffer buffer, int count)
+    /// <summary>
+    /// Points the material at <paramref name="buffer"/> and sizes the args buffer.
+    /// Split out of <see cref="Render"/> so the screen-space path can bind the same
+    /// way without issuing the disc draw.
+    /// </summary>
+    private bool EnsureBound(ComputeBuffer buffer, int count)
     {
-        if (buffer == null || count <= 0) return;
+        if (buffer == null || count <= 0) return false;
 
         if (boundBuffer != buffer || boundCount != count)
         {
@@ -263,6 +475,13 @@ public class ParticleRenderer2D : MonoBehaviour
             boundBuffer = buffer;
             boundCount = count;
         }
+
+        return true;
+    }
+
+    private void Render(ComputeBuffer buffer, int count)
+    {
+        if (!EnsureBound(buffer, count)) return;
 
         if (needsSettingsUpdate)
         {
