@@ -132,6 +132,7 @@ GameObject:
   - component: {fileID: 143382746}
   - component: {fileID: 143382747}
   - component: {fileID: 143382748}
+  - component: {fileID: 143382749}
   m_Layer: 0
   m_Name: FluidSim
   m_TagString: Untagged
@@ -208,10 +209,15 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::ParticleRenderer2D
   gpuSource: {fileID: 143382747}
+  particleShader: {fileID: 4800000, guid: e4ab5b8ea1c34d1a9067ff3440a20dd3, type: 3}
   particleRadius: 0.055
   autoParticleRadius: 1
   particleRadiusInSpacing: 0.8
   velocityDisplayMax: 20
+  autoVelocityMax: 1
+  velocityMaxPadding: 0.5
+  velocityMaxSmoothing: 2
+  minVelocityRange: 1
   preset: 5
   colourMap:
     serializedVersion: 2
@@ -244,14 +250,19 @@ MonoBehaviour:
     m_NumColorKeys: 2
     m_NumAlphaKeys: 2
   gradientResolution: 128
-  autoVelocityMax: 1
-  velocityMaxPadding: 0.5
-  velocityMaxSmoothing: 2
-  minVelocityRange: 1
   impostorLightDirection: {x: -0.4, y: 0.5, z: 0.8}
   impostorAmbient: 0.35
   impostorSpecular: 0
   impostorShininess: 32
+  useScreenSpaceSurface: 0
+  surfaceShader: {fileID: 0}
+  targetCamera: {fileID: 0}
+  surfaceRangeSigma: 0.05
+  surfaceAmbient: 0.35
+  surfaceSpecular: 0.6
+  surfaceShininess: 48
+  surfaceEdgeSoftness: 1
+  surfaceLightDirection: {x: -0.4, y: 0.5, z: -0.8}
 --- !u!114 &143382747
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -291,6 +302,31 @@ MonoBehaviour:
   showGizmos: 0
   gizmoReadbackInterval: 15
   gizmoRadius: 0.03
+--- !u!114 &143382749
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 143382743}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: da7547640bd624d72aecd844b0d62647, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::SPHInteractor2D
+  solver: {fileID: 0}
+  gpuSimulation: {fileID: 0}
+  targetCamera: {fileID: 0}
+  enableInteraction: 1
+  radiusInSpacing: 1
+  radiusInSpacings: 9
+  radius: 0.6
+  maxPointerSpeed: 12
+  restitution: 0.05
+  friction: 0.35
+  minimumPressDuration: 0.12
+  allowPause: 1
+  showPointerGizmo: 1
 --- !u!1 &330585543
 GameObject:
   m_ObjectHideFlags: 0

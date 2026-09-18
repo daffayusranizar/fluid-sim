@@ -96,6 +96,35 @@ public class SPH2D : MonoBehaviour
              "drawing both doubles the work.")]
     public bool showParticleGizmos = false;
 
+    // --- Interaction state (published by SPHInteractor2D) ---
+    // The solver never writes these; it reads what the interactor last pushed.
+    // Kept as plain values rather than a reference to the interactor so that
+    // removing the input layer also removes the interaction -- pointer.active stays
+    // false and every pass below behaves exactly as it did before this existed.
+
+    /// <summary>
+    /// The interactive disc, as last published. Read by the integrate pass only.
+    /// </summary>
+    /// <remarks>
+    /// NonSerialized, not merely HideInInspector. HideInInspector only hides the
+    /// field; Unity still tries to serialise it, and would write whatever the
+    /// interactor last pushed into the scene file. This is runtime state with a
+    /// runtime owner, so it must not survive a domain reload.
+    /// </remarks>
+    [System.NonSerialized] public PointerState pointer;
+
+    private bool paused;
+
+    /// <summary>
+    /// Freezes the solver without discarding state.
+    /// </summary>
+    /// <remarks>
+    /// A flag rather than <c>Time.timeScale</c>: timeScale would also stop the
+    /// interactor from reading the cursor, and the disc has to keep tracking the
+    /// mouse while paused or it lurches on resume.
+    /// </remarks>
+    public void SetPaused(bool value) => paused = value;
+
     // --- Native simulation state ---
     // Structure of arrays, so each pass writes one array and reads others with no
     // overlap. See ParticleState for why that matters.
@@ -486,6 +515,16 @@ public class SPH2D : MonoBehaviour
     {
         if (!state.IsCreated) return;
 
+        // The accumulator is cleared rather than left to grow while paused. Held,
+        // it would store the entire pause as a backlog and dump it into the substep
+        // loop on resume, which reads as a burst of fast-forward rather than as a
+        // resume.
+        if (paused)
+        {
+            timeAccumulator = 0f;
+            return;
+        }
+
         // A GPU simulation owns the state when it is driving; running the Burst
         // solver as well would advance the same particles twice.
         if (!solveOnCpu) return;
@@ -645,6 +684,7 @@ public class SPH2D : MonoBehaviour
             force = state.force,
             density = state.density,
             p = solverParams,
+            pointer = pointer,
             dt = dt,
         }.Schedule(state.Count, Mathf.Max(1, batchCount)).Complete();
     }

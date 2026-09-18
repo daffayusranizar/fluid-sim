@@ -118,6 +118,17 @@ float _DeltaTime;
 
 float2 _ProbeOffset;
 
+// --- Interactive pointer (T-038) ---
+// A solid disc the fluid cannot enter, published once per frame by
+// SPHInteractor2D and uploaded with the rest of the parameter block, so a pointer
+// costs no buffer and no extra dispatch.
+float2 _PointerPosition;
+float2 _PointerVelocity;
+float _PointerRadius;
+float _PointerRestitution;
+float _PointerFriction;
+uint _PointerActive;
+
 // ----------------------------------------------------------------------
 // Kernels and equation of state. Direct transcriptions of SPHMath.cs.
 // ----------------------------------------------------------------------
@@ -542,6 +553,50 @@ void ComputeViscosity(uint3 id : SV_DispatchThreadID)
 // Integration (T-028)
 // ----------------------------------------------------------------------
 
+/// Resolves one particle against the interactive pointer disc.
+///
+/// Twin of SPHMath.ResolvePointerCollision on the CPU. The two must stay in step:
+/// the only reason both solvers exist is that they can be compared, and a disc
+/// that behaves differently on each path makes that comparison worthless.
+///
+/// A position constraint, not a force. See the CPU version for why that matters
+/// to the time step.
+void ApplyPointer(inout float2 position, inout float2 velocity)
+{
+    if (_PointerActive == 0u) return;
+
+    float radius = max(1e-4, _PointerRadius);
+    float2 toParticle = position - _PointerPosition;
+    float distanceSq = dot(toParticle, toParticle);
+
+    if (distanceSq >= radius * radius) return;
+
+    float distance = sqrt(distanceSq);
+
+    // Exactly on the centre there is no direction to push along. Any direction is
+    // better than a NaN, which would spread into the density and force of every
+    // particle touching it.
+    float2 normal = distance > 1e-6 ? toParticle / distance : float2(0.0, 1.0);
+
+    position = _PointerPosition + normal * radius;
+
+    float2 relative = velocity - _PointerVelocity;
+    float inbound = dot(relative, normal);
+
+    if (inbound < 0.0)
+    {
+        relative -= (1.0 + _PointerRestitution) * inbound * normal;
+    }
+
+    // Tangential drag, relative to the disc: the difference between poking the
+    // fluid and scooping it.
+    float2 normalPart = dot(relative, normal) * normal;
+    float2 tangentPart = relative - normalPart;
+
+    velocity = _PointerVelocity + normalPart
+               + tangentPart * (1.0 - saturate(_PointerFriction));
+}
+
 [numthreads(64, 1, 1)]
 void Integrate(uint3 id : SV_DispatchThreadID)
 {
@@ -552,7 +607,21 @@ void Integrate(uint3 id : SV_DispatchThreadID)
 
     if (particleDensity <= 0.0001)
     {
-        _ParticlesOut[i] = _ParticlesIn[i];
+        // No force to integrate, but the pointer is a position constraint rather
+        // than a force, so it still applies. Skipping it here would leave a stray
+        // particle sitting inside a disc that every other particle respects.
+        // Locals rather than passing the struct members straight through: `inout`
+        // arguments have to be plain lvalues on some compilers, and this way the
+        // shape of the code matches the CPU job exactly.
+        Particle isolated = _ParticlesIn[i];
+        float2 isolatedPosition = isolated.position;
+        float2 isolatedVelocity = isolated.velocity;
+
+        ApplyPointer(isolatedPosition, isolatedVelocity);
+
+        isolated.position = isolatedPosition;
+        isolated.velocity = isolatedVelocity;
+        _ParticlesOut[i] = isolated;
         return;
     }
 
@@ -586,6 +655,11 @@ void Integrate(uint3 id : SV_DispatchThreadID)
         pos.y = _BoxCenter.y - _BoxHalfSize.y;
         v.y *= -_CollisionDamping;
     }
+
+    // Applied after the wall clamp, so the disc wins where the two disagree. The
+    // disc is kept a full radius clear of the walls on the CPU side (see
+    // SPHInteractor2D), so in practice they never both act on one particle.
+    ApplyPointer(pos, v);
 
     p.velocity = v;
     p.position = pos;

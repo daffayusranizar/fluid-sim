@@ -52,6 +52,15 @@ public class ParticleRenderer2D : MonoBehaviour
              "empty to render the Burst CPU solver instead.")]
     public SPHCompute gpuSource;
 
+    [Tooltip("FluidSim/Particle2D. Assign this in the scene rather than relying on " +
+             "Shader.Find: a shader that nothing references is stripped from a " +
+             "build, and Shader.Find then returns null in the player only. The " +
+             "Editor shows the fluid, the built app shows a black window, and the " +
+             "only trace is a line in the Player log. The serialised reference is " +
+             "what makes the shader reachable, so it is the assignment that " +
+             "matters, not the lookup.")]
+    public Shader particleShader;
+
     [Header("Particle Appearance")]
     [Tooltip("World-space radius of one particle disc. Ignored when " +
              "autoParticleRadius is on.")]
@@ -278,12 +287,15 @@ public class ParticleRenderer2D : MonoBehaviour
         // Auto-wire the GPU source when both live on the same object.
         if (gpuSource == null) gpuSource = GetComponent<SPHCompute>();
 
-        Shader shader = Shader.Find("FluidSim/Particle2D");
+        Shader shader = particleShader != null ? particleShader : Shader.Find("FluidSim/Particle2D");
 
         if (shader == null)
         {
             Debug.LogError("ParticleRenderer2D: shader 'FluidSim/Particle2D' not found. " +
-                           "Is Assets/Shaders/2D/Particle2D.shader imported?");
+                           "Assign particleShader in the scene, or check that " +
+                           "Assets/Shaders/2D/Particle2D.shader is imported. Note that " +
+                           "Shader.Find alone cannot resolve a shader in a build unless " +
+                           "something references it.");
             enabled = false;
             return;
         }

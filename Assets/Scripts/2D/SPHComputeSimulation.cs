@@ -56,6 +56,22 @@ public class SPHComputeSimulation : MonoBehaviour
     private Particle2D[] snapshot;
     private int activeCount;
 
+    // Published by SPHInteractor2D. The frame loop is the GPU path's owner of time,
+    // so the pause and the pointer land here and are forwarded to SPHCompute.
+    private PointerState pointer;
+    private bool paused;
+
+    /// <summary>
+    /// Publishes the interactive disc. Applied by SPHCompute's integrate kernel.
+    /// </summary>
+    public void SetPointer(in PointerState value) => pointer = value;
+
+    /// <summary>
+    /// Freezes the frame loop without discarding state. The GPU buffers keep
+    /// whatever they held, so resuming continues from where it stopped.
+    /// </summary>
+    public void SetPaused(bool value) => paused = value;
+
     private void Start()
     {
         if (source == null) source = GetComponent<SPH2D>();
@@ -88,6 +104,17 @@ public class SPHComputeSimulation : MonoBehaviour
     private void Update()
     {
         if (!compute.IsReady) return;
+
+        compute.SetPointer(pointer);
+
+        // Cleared rather than left to grow: held, the accumulator would store the
+        // whole pause as a backlog and dump it into the substep loop on resume,
+        // which reads as a burst of fast-forward rather than as a resume.
+        if (paused)
+        {
+            accumulator = 0f;
+            return;
+        }
 
         // Frame time goes into a buffer rather than straight into the integrator,
         // exactly as the CPU solver does: a slow frame produces more steps instead

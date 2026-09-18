@@ -142,6 +142,11 @@ public class SPHCompute : MonoBehaviour
     private SolverParams parameters;
     private bool hasParameters;
 
+    // The interactive disc the integrate kernel applies. Cached rather than
+    // uploaded on set, because it goes out with the rest of the parameter block in
+    // SetParameterUniforms -- one place that knows what the shader expects.
+    private PointerState pointer;
+
     private bool extremesPending;
     private AsyncGPUReadbackRequest extremesRequest;
 
@@ -350,6 +355,17 @@ public class SPHCompute : MonoBehaviour
         parameters = p;
         hasParameters = true;
     }
+
+    /// <summary>
+    /// Publishes the interactive pointer, applied by the integrate kernel.
+    /// </summary>
+    /// <remarks>
+    /// Called once per frame by <see cref="SPHComputeSimulation"/>, which is where
+    /// <see cref="SPHInteractor2D"/> sends it. Cached here rather than uploaded on
+    /// set because it is uploaded with the rest of the parameter block once per
+    /// substep -- so a pointer costs no buffer, no dispatch and no extra bandwidth.
+    /// </remarks>
+    public void SetPointer(in PointerState value) => pointer = value;
 
     // ------------------------------------------------------------------
     // Full step (T-029)
@@ -698,6 +714,13 @@ public class SPHCompute : MonoBehaviour
         // [MarshalAs(UnmanagedType.U1)] for the Burst direct calls.
         shader.SetInt("_ClampPressurePositive", parameters.clampPressurePositive ? 1 : 0);
         shader.SetInt("_UseBoundaryParticles", parameters.useBoundaryParticles ? 1 : 0);
+
+        shader.SetVector("_PointerPosition", new Vector4(pointer.position.x, pointer.position.y, 0f, 0f));
+        shader.SetVector("_PointerVelocity", new Vector4(pointer.velocity.x, pointer.velocity.y, 0f, 0f));
+        shader.SetFloat("_PointerRadius", pointer.radius);
+        shader.SetFloat("_PointerRestitution", pointer.restitution);
+        shader.SetFloat("_PointerFriction", pointer.friction);
+        shader.SetInt("_PointerActive", pointer.active ? 1 : 0);
     }
 
     // ------------------------------------------------------------------

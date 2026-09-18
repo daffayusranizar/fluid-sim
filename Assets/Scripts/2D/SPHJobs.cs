@@ -247,12 +247,33 @@ public struct IntegrateJob : IJobParallelFor
     [ReadOnly] public NativeArray<float> density;
 
     public SolverParams p;
+
+    /// <summary>
+    /// The interactive disc. A position constraint applied after the wall clamp,
+    /// so it wins where the two disagree.
+    /// </summary>
+    public PointerState pointer;
+
     public float dt;
 
     public void Execute(int i)
     {
         float particleDensity = density[i];
-        if (particleDensity <= 0.0001f) return;
+
+        if (particleDensity <= 0.0001f)
+        {
+            // Nothing to integrate, but the pointer constrains position rather than
+            // applying a force, so it still applies. Skipping it would leave a
+            // stray particle inside a disc every other particle respects.
+            float2 isolatedPosition = position[i];
+            float2 isolatedVelocity = velocity[i];
+
+            SPHMath.ResolvePointerCollision(pointer, ref isolatedPosition, ref isolatedVelocity);
+
+            position[i] = isolatedPosition;
+            velocity[i] = isolatedVelocity;
+            return;
+        }
 
         float2 acceleration = force[i] / particleDensity + p.gravity;
         float2 v = velocity[i] + acceleration * dt;
@@ -284,6 +305,11 @@ public struct IntegrateJob : IJobParallelFor
             pos.y = p.boxCenter.y - p.boxHalfSize.y;
             v.y *= -p.collisionDamping;
         }
+
+        // After the wall clamp, so the disc wins if both act on one particle.
+        // SPHInteractor2D keeps the disc a full radius clear of the walls, so in
+        // practice only one of them ever does.
+        SPHMath.ResolvePointerCollision(pointer, ref pos, ref v);
 
         velocity[i] = v;
         position[i] = pos;

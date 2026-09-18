@@ -170,4 +170,74 @@ public static class SPHMath
 
         return p;
     }
+
+    // ------------------------------------------------------------------
+    // Interaction
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// Resolves one particle against the interactive pointer disc.
+    /// </summary>
+    /// <remarks>
+    /// A position constraint rather than a force, and that choice is what makes
+    /// the interaction safe. A force applied inside a radius would inject energy
+    /// the CFL step then has to absorb: peak speed rises, dt shrinks, and at a
+    /// fixed substep cap the fluid silently starts running in slow motion instead
+    /// of visibly breaking. Clamping position and resolving velocity against the
+    /// disc's own motion cannot do that -- the disc carries at most the velocity it
+    /// was given, and it was given a capped one.
+    ///
+    /// The disc is deliberately absolute: it ignores <c>p.restDensity</c> and the
+    /// pressure field entirely, so contact does not depend on being near rest
+    /// density and stays predictable at a free surface.
+    ///
+    /// The GPU twin of this function is <c>ApplyPointer</c> in SPH2D.compute. The
+    /// two must stay in step, or the CPU and GPU solvers stop being comparable,
+    /// which is the only reason to keep both paths at all.
+    /// </remarks>
+    [BurstCompile]
+    public static void ResolvePointerCollision(
+        in PointerState pointer,
+        ref float2 position,
+        ref float2 velocity)
+    {
+        if (!pointer.active) return;
+
+        float radius = math.max(1e-4f, pointer.radius);
+        float2 toParticle = position - pointer.position;
+        float distanceSq = math.lengthsq(toParticle);
+
+        if (distanceSq >= radius * radius) return;
+
+        float distance = math.sqrt(distanceSq);
+
+        // Exactly on the centre there is no direction to push along. Any direction
+        // is better than dividing by zero here: a NaN would propagate into the
+        // density and force of every particle that touches it.
+        float2 normal = distance > 1e-6f ? toParticle / distance : new float2(0f, 1f);
+
+        // The disc is solid. Snapping to the surface is what ejects particles that
+        // were already inside when it appeared, which is what a tap feels like.
+        position = pointer.position + normal * radius;
+
+        // Everything below is relative to the disc, so a disc moving at velocity V
+        // transfers V to the fluid it touches rather than acting like a static wall.
+        float2 relative = velocity - pointer.velocity;
+        float inbound = math.dot(relative, normal);
+
+        // Only remove motion going into the disc. An outward-moving particle keeps
+        // its speed, so the disc can never brake fluid that is already leaving.
+        if (inbound < 0f)
+        {
+            relative -= (1f + pointer.restitution) * inbound * normal;
+        }
+
+        // Tangential drag is the difference between poking the fluid and scooping
+        // it. Without this term a fast drag slides through the water and the fluid
+        // only ever moves radially out of the way, which reads as stirring air.
+        float2 normalPart = math.dot(relative, normal) * normal;
+        float2 tangentPart = relative - normalPart;
+
+        velocity = pointer.velocity + normalPart + tangentPart * (1f - math.saturate(pointer.friction));
+    }
 }

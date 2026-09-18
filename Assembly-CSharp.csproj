@@ -59,10 +59,12 @@
     <Compile Include="Assets/Scripts/2D/SPHSolver.cs" />
     <Compile Include="Assets/Scripts/2D/ParticleRenderer2D.cs" />
     <Compile Include="Assets/TutorialInfo/Readme.cs" />
+    <Compile Include="Assets/Scripts/2D/SPHInteractor2D.cs" />
     <Compile Include="Assets/Scripts/2D/Particle2D.cs" />
     <Compile Include="Assets/Scripts/2D/SPHGrid.cs" />
     <Compile Include="Assets/Scripts/2D/SPHJobs.cs" />
     <Compile Include="Assets/Scripts/2D/SPH2D.cs" />
+    <Compile Include="Assets/Scripts/2D/PointerState.cs" />
     <Compile Include="Assets/Scripts/2D/SPHCompute.cs" />
   </ItemGroup>
   <ItemGroup>
