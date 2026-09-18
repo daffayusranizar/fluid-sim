@@ -45,6 +45,32 @@ public class ParticleRenderer2D : MonoBehaviour
         SpeedRainbow,
     }
 
+    /// <summary>
+    /// What the colour ramp is sampled by.
+    /// </summary>
+    public enum ColourSource
+    {
+        /// <summary>
+        /// By speed, scaled against a range that follows the simulation's peak.
+        /// </summary>
+        Speed,
+
+        /// <summary>
+        /// By density, scaled around rest density.
+        /// </summary>
+        /// <remarks>
+        /// This is not the same kind of measure as speed, and deliberately so.
+        /// Speed colouring answers "what is moving fast right now", so it has to
+        /// follow the peak: a still fluid has nothing fast in it and the ramp must
+        /// still spread across its slow handful of particles. Density colouring
+        /// answers "where is this fluid compressed or expanded", which is a question
+        /// about the fluid's own rest state, so it is anchored to rest density and
+        /// never auto-ranged. A fluid sitting uniformly at rest renders as one flat
+        /// colour, and every visible band is a real departure from rest.
+        /// </remarks>
+        Density,
+    }
+
     [Header("Source")]
     [Tooltip("Optional GPU solver. When set, the renderer binds the solver's own " +
              "particle buffer instead of packing and uploading CPU state, so a GPU " +
@@ -64,21 +90,26 @@ public class ParticleRenderer2D : MonoBehaviour
     [Header("Particle Appearance")]
     [Tooltip("World-space radius of one particle disc. Ignored when " +
              "autoParticleRadius is on.")]
-    // Manual fallback only. 0.055 is 0.8 x the spacing at 5000 particles, so
+    // Manual fallback only. 0.0548 is 1.0 x the spacing at 8000 particles, so
     // switching autoParticleRadius off does not change the look.
-    public float particleRadius = 0.055f;
+    public float particleRadius = 0.0548f;
 
     [Tooltip("Size impostors from the particle spacing instead of a fixed radius. " +
              "Without this the same number means 'separate dots' at 400 particles " +
              "and 'one body' at 5000, because the spacing changes with the count.")]
     public bool autoParticleRadius = true;
 
-    [Tooltip("Impostor radius per unit of particle spacing. The world-space disc " +
-             "radius is HALF of this, so a value of 0.8 gives discs 0.8 x spacing " +
-             "across. Below ~1.13 the discs leave gaps and read as separate " +
-             "particles; at ~1.13 they just tile the area into one sheet; above " +
-             "that they overlap into a solid mass.")]
-    public float particleRadiusInSpacing = 0.8f;
+    [Tooltip("Disc diameter per unit of particle spacing. This is a SPLAT size, " +
+             "not a physical size -- the solver has no notion of particle radius, so " +
+             "nothing here affects the simulation.\n\n" +
+             "The disc-to-spacing ratio is all this controls; the count sets the " +
+             "absolute size. 1.0 leaves visible gaps. ~1.13 is where the gaps just " +
+             "close and the packing reads as one sheet. Above that the discs overlap, " +
+             "which is a legitimate look -- rendering splats larger than the spacing " +
+             "is the usual way to make a fluid continuous -- but it stops reading as " +
+             "individual particles, so it is a different aesthetic rather than a " +
+             "bigger version of this one.")]
+    public float particleRadiusInSpacing = 1f;
 
     [Tooltip("Speed mapped to the top of the colour gradient. Particles at or " +
              "above this render as the gradient's final colour. Ignored when " +
@@ -108,6 +139,20 @@ public class ParticleRenderer2D : MonoBehaviour
     [Tooltip("Floor for the auto range. Without one, a fluid at rest collapses the " +
              "ramp to zero and every particle samples the top stop.")]
     public float minVelocityRange = 1f;
+
+    [Tooltip("What the ramp is sampled by. Density is anchored to rest density, so " +
+             "a fluid at rest is one flat colour rather than a full rainbow.")]
+    public ColourSource colourSource = ColourSource.Speed;
+
+    [Tooltip("Density at the ends of the ramp, as a fraction of rest density. The " +
+             "default spans rest density plus or minus 15%, so with rest density at " +
+             "1000 the ramp covers 850 to 1150 and rest sits in the middle.\n\n" +
+             "This is a trade-off, not a tuned value. Tight (0.02-0.05) resolves " +
+             "structure inside the bulk, where density only varies by a few percent, " +
+             "but clips every free surface to one end. Wide (0.3+) brackets the whole " +
+             "field including surfaces, but flattens the interior. Pick it for what " +
+             "you want to look at.")]
+    public float densityHalfRange = 0.15f;
 
     [Tooltip("Ready-made ramp. Pick Custom to use the gradient below instead. " +
              "SpeedRainbow is ordered slow-to-fast: blue, green, red.")]
@@ -148,9 +193,12 @@ public class ParticleRenderer2D : MonoBehaviour
     public Camera targetCamera;
 
     [Tooltip("Depth similarity tolerance for the bilateral blur, in world units. " +
-             "Roughly the particle radius: larger blends across the silhouette, " +
-             "smaller leaves disc seams.")]
-    public float surfaceRangeSigma = 0.05f;
+             "This tracks the depth relief across one impostor, which is its disc " +
+             "radius -- half the impostor size -- so it has to move with " +
+             "particleRadiusInSpacing or the filter stops matching the geometry. " +
+             "Larger blends across the silhouette, smaller leaves disc seams. Only " +
+             "used by the screen-space surface.")]
+    public float surfaceRangeSigma = 0.0625f;
 
     [Range(0f, 1f)] public float surfaceAmbient = 0.35f;
     [Range(0f, 1f)] public float surfaceSpecular = 0.6f;
@@ -660,6 +708,20 @@ public class ParticleRenderer2D : MonoBehaviour
         Gradient ramp = GradientForPreset(preset) ?? colourMap;
         TextureFromGradient(ref gradientTexture, gradientResolution, ramp);
         material.SetTexture("ColourMap", gradientTexture);
+
+        // Which end of the ramp means what is decided entirely by the source, so the
+        // presets above are shared: they are slow-to-fast for speed, and
+        // expanded-to-compressed for density. That is the same visual language read
+        // off a different quantity.
+        material.SetFloat("_ColourSource", (int)colourSource);
+
+        // Anchored to the solver's rest density rather than to anything observed, so
+        // a given colour means the same physical state from frame to frame and across
+        // the two solvers. ColourParameter in Particle2D.shader holds the reason
+        // auto-ranging would invert the meaning here.
+        float restDensity = sim != null ? sim.restDensity : 1000f;
+        material.SetFloat("_DensityCentre", restDensity);
+        material.SetFloat("_DensityHalfRange", Mathf.Max(0.0001f, restDensity * densityHalfRange));
     }
 
     /// <summary>

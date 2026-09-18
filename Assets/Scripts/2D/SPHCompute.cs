@@ -72,13 +72,20 @@ public class SPHCompute : MonoBehaviour
     [Tooltip("Compute shader asset. Needs every kernel in SPH2D.compute.")]
     public ComputeShader shader;
 
-    [Tooltip("Particle capacity. Buffers are allocated to this by Initialize().")]
-    public int particleCapacity = 5000;
+    // Overwritten at runtime. SPHComputeSimulation.Start passes SPH2D.particleCount
+    // to Initialize, which assigns it here, so the count in the scene is the
+    // authority and this field is only a starting point. Kept in step with SPH2D so
+    // the Inspector does not mislead and so the round-trip probe allocates the right
+    // size when it is enabled.
+    [Tooltip("Particle capacity. Buffers are allocated to this by Initialize(), " +
+             "which SPHComputeSimulation calls with SPH2D.particleCount, so in play " +
+             "this value is replaced rather than read.")]
+    public int particleCapacity = 8000;
 
     [Tooltip("Only used by the round-trip probe. The simulation takes the real " +
-             "value from SolverParams, which is spawnSpacing squared (0.0048 at " +
-             "5000 particles).")]
-    public float boundaryVolume = 0.0048f;
+             "value from SolverParams, which is spawnSpacing squared (0.0030 at " +
+             "8000 particles).")]
+    public float boundaryVolume = 0.003f;
 
     [Tooltip("Run the round-trip self test once in Start(). Turn this off once " +
              "SPHComputeSimulation is driving the pipeline.")]

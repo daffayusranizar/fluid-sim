@@ -168,12 +168,12 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::SPH2D
   boxSize: {x: 10, y: 10}
-  particleCount: 5000
+  particleCount: 8000
   gravity: {x: 0, y: -9.81}
   collisionDamping: 0.5
   smoothingLengthInSpacing: 2.2
   smoothingLength: 2
-  maxSubSteps: 64
+  maxSubSteps: 96
   cflFactor: 0.25
   minTimeStep: 0.0002
   maxTimeStep: 0.02
@@ -210,14 +210,16 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::ParticleRenderer2D
   gpuSource: {fileID: 143382747}
   particleShader: {fileID: 4800000, guid: e4ab5b8ea1c34d1a9067ff3440a20dd3, type: 3}
-  particleRadius: 0.055
+  particleRadius: 0.1095
   autoParticleRadius: 1
-  particleRadiusInSpacing: 0.8
+  particleRadiusInSpacing: 2
   velocityDisplayMax: 20
   autoVelocityMax: 1
   velocityMaxPadding: 0.5
   velocityMaxSmoothing: 2
   minVelocityRange: 1
+  colourSource: 0
+  densityHalfRange: 0.15
   preset: 5
   colourMap:
     serializedVersion: 2
@@ -257,7 +259,7 @@ MonoBehaviour:
   useScreenSpaceSurface: 0
   surfaceShader: {fileID: 0}
   targetCamera: {fileID: 0}
-  surfaceRangeSigma: 0.05
+  surfaceRangeSigma: 0.125
   surfaceAmbient: 0.35
   surfaceSpecular: 0.6
   surfaceShininess: 48
@@ -295,7 +297,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::SPHComputeSimulation
   source: {fileID: 143382745}
   compute: {fileID: 143382747}
-  maxSubSteps: 64
+  maxSubSteps: 96
   cflFactor: 0.25
   minTimeStep: 0.0002
   maxTimeStep: 0.02
@@ -324,6 +326,7 @@ MonoBehaviour:
   maxPointerSpeed: 12
   restitution: 0.05
   friction: 0.35
+  radiusGrowthTime: 0.15
   minimumPressDuration: 0.12
   allowPause: 1
   showPointerGizmo: 1

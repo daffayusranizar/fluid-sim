@@ -621,6 +621,9 @@ void Integrate(uint3 id : SV_DispatchThreadID)
 
         isolated.position = isolatedPosition;
         isolated.velocity = isolatedVelocity;
+
+        // Same reason as the main path below: the renderer binds this struct.
+        isolated.density = particleDensity;
         _ParticlesOut[i] = isolated;
         return;
     }
@@ -663,6 +666,16 @@ void Integrate(uint3 id : SV_DispatchThreadID)
 
     p.velocity = v;
     p.position = pos;
+
+    // The struct's density is otherwise dead weight: every kernel reads the separate
+    // _Density buffer, so nothing was maintaining this field. But the RENDERER binds
+    // this struct, so leaving it alone means the render shader reads whatever value
+    // the field held when the buffer was seeded at spawn. That value is not zero and
+    // not obviously wrong, which makes it the worst kind of stale: density colouring
+    // would render a plausible frozen picture of the t=0 fluid and never change.
+    // Copying it here costs one store of a value already in a register, and it makes
+    // the render view identical on both solvers rather than one live and one frozen.
+    p.density = particleDensity;
 
     _ParticlesOut[i] = p;
 }

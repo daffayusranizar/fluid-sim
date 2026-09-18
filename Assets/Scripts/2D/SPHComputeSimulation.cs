@@ -31,9 +31,10 @@ public class SPHComputeSimulation : MonoBehaviour
     public SPHCompute compute;
 
     [Header("Time stepping")]
-    // Must match SPH2D's cap: 5000 particles need ~33 substeps per frame to keep
-    // up with real time, so 32 would clamp and lose fluid time.
-    public int maxSubSteps = 64;
+    // Must match SPH2D's cap: 8000 particles need ~42 substeps per frame to keep up
+    // with real time, so a cap near that would clamp and lose fluid time instead of
+    // visibly breaking. SPH2D carries the derivation.
+    public int maxSubSteps = 96;
     [Range(0.05f, 0.5f)] public float cflFactor = 0.25f;
     public float minTimeStep = 0.0002f;
     public float maxTimeStep = 0.02f;
@@ -48,8 +49,8 @@ public class SPHComputeSimulation : MonoBehaviour
     public int gizmoReadbackInterval = 15;
 
     [Tooltip("Gizmo sphere radius, world units. Sized to roughly half the particle " +
-             "spacing at 5000 particles (0.069), so the spheres stay distinct.")]
-    public float gizmoRadius = 0.03f;
+             "spacing at 8000 particles (0.055), so the spheres stay distinct.")]
+    public float gizmoRadius = 0.027f;
 
     private float accumulator;
     private int frameCounter;

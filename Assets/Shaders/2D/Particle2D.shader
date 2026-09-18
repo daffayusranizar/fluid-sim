@@ -22,6 +22,14 @@ Shader "FluidSim/Particle2D"
         _ParticleRadius ("Particle Radius", Float) = 0.1
         _VelocityMax ("Velocity Display Max", Float) = 5
 
+        // 0 samples the ramp by speed, 1 by density. A uniform branch rather than a
+        // shader_feature: the choice is coherent across a whole draw, so it costs
+        // nothing per fragment, and a keyword would double the variant count to
+        // save that nothing.
+        _ColourSource ("Colour Source (0 speed, 1 density)", Float) = 0
+        _DensityCentre ("Density Centre", Float) = 1000
+        _DensityHalfRange ("Density Half Range", Float) = 50
+
         _LightDir ("Impostor Light Direction", Vector) = (-0.4, 0.5, 0.8, 0)
         _Ambient ("Impostor Ambient", Range(0, 1)) = 0.35
         _Specular ("Impostor Specular", Range(0, 1)) = 0.35
@@ -67,6 +75,9 @@ Shader "FluidSim/Particle2D"
 
         float _ParticleRadius;
         float _VelocityMax;
+        float _ColourSource;
+        float _DensityCentre;
+        float _DensityHalfRange;
 
         float4 _LightDir;
         float _Ambient;
@@ -89,16 +100,47 @@ Shader "FluidSim/Particle2D"
             float speed : TEXCOORD3;
         };
 
+        /// Where along the colour ramp a particle samples, 0..1.
+        ///
+        /// The two sources are scaled on deliberately different principles, and the
+        /// difference is the whole reason density is worth having as an option.
+        ///
+        /// Speed is scaled against a range that follows the simulation's own peak,
+        /// because for speed only the relative fast/slow within the current frame
+        /// matters: a still fluid has no fast particles, and mapping its handful of
+        /// slow ones across the full ramp is exactly what makes structure visible.
+        ///
+        /// Density is anchored to rest density instead, and must be. Scaling density
+        /// to its own observed range would stretch the full ramp across whatever
+        /// spread happened to be present, so a fluid sitting perfectly at rest would
+        /// show a complete rainbow -- the most uniform possible state rendered as the
+        /// most varied. Anchoring means uniform density is one flat colour and every
+        /// visible band is a real departure from rest.
+        float ColourParameter(Particle p)
+        {
+            if (_ColourSource > 0.5)
+            {
+                // Two-sided about the centre, so compression and expansion land on
+                // opposite ends of the ramp and rest sits in the middle. Measured as
+                // a difference rather than from zero: a density of 950 out of 2000
+                // says nothing, whereas 950 against a rest density of 1000 says
+                // "expanded by 5%".
+                float half = max(_DensityHalfRange, 1e-4);
+                return saturate(0.5 + (p.density - _DensityCentre) / (2.0 * half));
+            }
+
+            return saturate(length(p.velocity) / max(_VelocityMax, 1e-5));
+        }
+
         Varyings vert(Attributes IN, uint instanceID : SV_InstanceID)
         {
             Varyings OUT;
 
             Particle p = Particles[instanceID];
 
-            float speed = length(p.velocity);
-            float t = saturate(speed / max(_VelocityMax, 1e-5));
+            float t = ColourParameter(p);
             OUT.colour = ColourMap.SampleLevel(sampler_ColourMap, float2(t, 0.5f), 0).rgb;
-            OUT.speed = speed;
+            OUT.speed = length(p.velocity);
 
             // Particle positions are already world space, so build the quad in world
             // space directly and skip the object transform entirely. The quad is flat

@@ -18,7 +18,7 @@ public class SPH2D : MonoBehaviour
     [Header("Particles")]
     [Tooltip("Total number of particles. Spawning is a blue-noise scatter, so " +
              "there is no grid to describe and no x-by-y split.")]
-    public int particleCount = 5000;
+    public int particleCount = 8000;
 
     [Header("Physics")]
     public Vector2 gravity = new Vector2(0f, -9.81f);
@@ -31,10 +31,12 @@ public class SPH2D : MonoBehaviour
     [HideInInspector] public float smoothingLength = 2f;
 
     [Header("Simulation")]
-    // 5000 particles in the default spawn region gives h = 0.152 and a CFL step of
-    // 0.5-0.7 ms, so keeping up with real time needs ~33 substeps per 60 Hz frame.
-    // The cap has to sit above that or the fluid silently falls behind.
-    public int maxSubSteps = 64;
+    // 8000 particles in the default spawn region gives h = 0.120 and a CFL step of
+    // 0.40-0.55 ms, so keeping up with real time needs ~42 substeps per 60 Hz frame.
+    // The cap has to sit above that or the fluid silently falls behind. 64 covered
+    // 5000 with room to spare and would still cover 8000, but only just, and the
+    // margin is what absorbs a drag raising the peak speed and shrinking dt further.
+    public int maxSubSteps = 96;
     [Range(0.05f, 0.5f)] public float cflFactor = 0.25f;
     public float minTimeStep = 0.0002f;
     public float maxTimeStep = 0.02f;
@@ -83,7 +85,7 @@ public class SPH2D : MonoBehaviour
     [Header("Debug Visualization")]
     public bool debugLogs = false;
 
-    // Off by default. At 5000 particles these draw 5000 spheres and 5000 arrows in
+    // Off by default. At 8000 particles these draw 8000 spheres and 8000 arrows in
     // the Scene view every repaint, which is slower than the simulation itself and
     // unreadable anyway. ParticleRenderer2D draws the fluid.
     public bool showForceArrows = false;
@@ -743,8 +745,8 @@ public class SPH2D : MonoBehaviour
         Gizmos.color = Color.blue;
         Gizmos.DrawWireCube(transform.position, new Vector3(boxSize.x, boxSize.y, 0f));
 
-        // Everything below needs the managed snapshot, which is a 5000-element copy
-        // per repaint. At 400 particles that was free; at 5000 it is not, and the
+        // Everything below needs the managed snapshot, which is an 8000-element copy
+        // per repaint. At 400 particles that was free; at 8000 it is not, and the
         // boundary overlay alone is over a thousand spheres.
         bool needsSnapshot = showParticleGizmos || showForceArrows || showViscosityArrows;
         if (!needsSnapshot) return;

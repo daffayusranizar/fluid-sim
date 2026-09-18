@@ -48,8 +48,8 @@ public class SPHInteractor2D : MonoBehaviour
              "changes with the count.")]
     public bool radiusInSpacing = true;
 
-    [Tooltip("Disc radius measured in particle spacings. At 5000 particles in the " +
-             "default container one spacing is 0.069, so 9 gives a disc about 0.62 " +
+    [Tooltip("Disc radius measured in particle spacings. At 8000 particles in the " +
+             "default container one spacing is 0.055, so 9 gives a disc about 0.49 " +
              "world units across the radius.")]
     public float radiusInSpacings = 9f;
 
