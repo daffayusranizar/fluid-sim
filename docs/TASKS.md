@@ -220,8 +220,8 @@ Record the outcome of each decision as you make it. The point is that these are 
 
 | # | Decision | Options | Chosen | Reason |
 |---|---|---|---|---|
-| 1 | Boundary particles in the spatial grid (T-023) | shared grid / separate static grid / exclude | | |
-| 2 | Boundary particles on GPU (T-026) | port to a static buffer / drop and rely on the clamp | | |
+| 1 | Boundary particles in the spatial grid (T-023) | shared grid / separate static grid / exclude | shared grid | They are static, so their cell membership is computed once at spawn and never changes, and the query already walks the 3x3 neighbourhood anyway. A second grid would duplicate that traversal for no gain; excluding them breaks wall behaviour, which is a Phase 1 invariant. |
+| 2 | Boundary particles on GPU (T-026) | port to a static buffer / drop and rely on the clamp | port to a static buffer | Dropping them reintroduces T-020's wall-welding on the GPU, in the phase where it is hardest to diagnose. They are static, so the cost is one buffer plus one scalar (`boundaryVolume`) rather than a subsystem. `SPHCompute` parks a one-element buffer when they are disabled, because the kernel reads element 0 unconditionally and a zero-length `ComputeBuffer` cannot be allocated. |
 | 3 | Boundary push on GPU (T-028) | pressure mirroring / penalty force / none | | |
 | 4 | Adaptive step under zero readback (T-029) | async readback / GPU-resident dt / fixed dt | | |
 

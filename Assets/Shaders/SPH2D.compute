@@ -1,0 +1,65 @@
+// GPU-side SPH pipeline.
+//
+// T-026 is data flow, not physics: the particle struct, the buffers, and one
+// kernel that proves a CPU -> GPU -> CPU round trip. Density and pressure arrive
+// in T-027, forces and integration in T-028, and the removal of the per-frame
+// readback in T-029.
+//
+// The struct must match Particle2D field for field. HLSL packs each float2 at
+// its natural 8-byte alignment, which lands every field at the same offset the
+// C# struct has, giving 40 bytes on both sides. That is also the stride
+// ParticleRenderer2D already uploads, so the buffer written here is the buffer
+// the renderer will read at T-032 with no repacking.
+
+#pragma kernel ProbeRoundTrip
+
+struct Particle
+{
+    float2 position;     // offset  0
+    float2 velocity;     // offset  8
+    float2 force;        // offset 16
+    float density;       // offset 24
+    float pressure;      // offset 28
+    float nearDensity;   // offset 32
+    float nearPressure;  // offset 36
+};                       // 40 bytes
+
+StructuredBuffer<Particle> _ParticlesIn;
+RWStructuredBuffer<Particle> _ParticlesOut;
+
+// Boundary particles are static: uploaded once, never written, never integrated.
+// They get their own buffer and a single scalar (_BoundaryVolume) rather than a
+// role in the simulation state, because that is genuinely all the solver needs
+// to use them. Decision recorded in docs/TASKS.md, GPU Port Decisions #2.
+StructuredBuffer<float2> _BoundaryPositions;
+
+uint _ParticleCount;
+float _BoundaryVolume;
+float2 _ProbeOffset;
+
+[numthreads(64, 1, 1)]
+void ProbeRoundTrip(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+
+    // Dispatch always rounds up to a whole number of thread groups, so the final
+    // group can contain threads past the end of the array. They must return
+    // before touching a buffer or they read and write out of bounds.
+    if (i >= _ParticleCount) return;
+
+    Particle p = _ParticlesIn[i];
+
+    // Deterministic transform, so the CPU can prove the GPU actually ran. The
+    // offset is supplied from C# rather than hardcoded here so both sides agree
+    // on one value.
+    p.position += _ProbeOffset;
+
+    // Reads the boundary inputs so a missing or unbound binding fails here,
+    // loudly, instead of at T-028 where it would present as a density bug. This
+    // covers all three GPU input paths at once: the particle buffer, the static
+    // boundary buffer, and the single scalar constant.
+    p.force = _BoundaryPositions[0];
+    p.density = _BoundaryVolume;
+
+    _ParticlesOut[i] = p;
+}
