@@ -28,6 +28,12 @@ Shader "FluidSim/Particle2D"
         _Shininess ("Impostor Shininess", Float) = 32
 
         _FarDepth ("Far Depth", Float) = 10000
+
+        // Declared, not just an HLSL uniform. A texture that only exists as
+        // HLSL cannot be relied on to stay bound: Material.SetTexture needs the
+        // property to exist in the block, and an undeclared one silently renders
+        // as the default -- which is how the fluid loses its colour entirely.
+        [NoScaleOffset] ColourMap ("Colour Map", 2D) = "white" {}
     }
 
     SubShader

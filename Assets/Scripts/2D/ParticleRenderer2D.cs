@@ -266,7 +266,7 @@ public class ParticleRenderer2D : MonoBehaviour
         if (shader == null)
         {
             Debug.LogError("ParticleRenderer2D: shader 'FluidSim/Particle2D' not found. " +
-                           "Is Assets/Shaders/Particle2D.shader imported?");
+                           "Is Assets/Shaders/2D/Particle2D.shader imported?");
             enabled = false;
             return;
         }

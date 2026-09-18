@@ -53,24 +53,24 @@
     <Analyzer Include="/Applications/Unity/Hub/Editor/6000.6.0f1/Unity.app/Contents/Resources/Scripting/BCLExtensions/TargetingPacks/netstandard2.1/analyzers/dotnet/roslyn4.0/cs/System.Text.Json.SourceGeneration.dll" />
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="Assets/Scripts/SPHJobs.cs" />
-    <Compile Include="Assets/Scripts/ParticleState.cs" />
-    <Compile Include="Assets/Scripts/SPHMath.cs" />
-    <Compile Include="Assets/Scripts/Particle2D.cs" />
-    <Compile Include="Assets/Scripts/SPHGrid.cs" />
-    <Compile Include="Assets/Scripts/ParticleRenderer2D.cs" />
+    <Compile Include="Assets/Scripts/2D/SPHComputeSimulation.cs" />
+    <Compile Include="Assets/Scripts/2D/SPHMath.cs" />
+    <Compile Include="Assets/Scripts/2D/ParticleState.cs" />
+    <Compile Include="Assets/Scripts/2D/SPHSolver.cs" />
+    <Compile Include="Assets/Scripts/2D/ParticleRenderer2D.cs" />
     <Compile Include="Assets/TutorialInfo/Readme.cs" />
-    <Compile Include="Assets/Scripts/SPHSolver.cs" />
-    <Compile Include="Assets/Scripts/SPHComputeSimulation.cs" />
-    <Compile Include="Assets/Scripts/SPH2D.cs" />
-    <Compile Include="Assets/Scripts/SPHCompute.cs" />
+    <Compile Include="Assets/Scripts/2D/Particle2D.cs" />
+    <Compile Include="Assets/Scripts/2D/SPHGrid.cs" />
+    <Compile Include="Assets/Scripts/2D/SPHJobs.cs" />
+    <Compile Include="Assets/Scripts/2D/SPH2D.cs" />
+    <Compile Include="Assets/Scripts/2D/SPHCompute.cs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="Assets/TutorialInfo/StyleSheets/ReadmeEditor.uss" />
-    <None Include="Assets/Shaders/FluidSurface.shader" />
-    <None Include="Assets/Shaders/Particle2D.shader" />
+    <None Include="Assets/Shaders/2D/FluidSurface.shader" />
+    <None Include="Assets/Shaders/2D/Particle2D.shader" />
     <None Include="Assets/TutorialInfo/StyleSheets/ReadmeEditorLight.uss" />
-    <None Include="Assets/Shaders/SPH2D.compute" />
+    <None Include="Assets/Shaders/2D/SPH2D.compute" />
     <None Include="Assets/TutorialInfo/StyleSheets/ReadmeEditorDark.uss" />
   </ItemGroup>
   <ItemGroup>
