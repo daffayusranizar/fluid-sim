@@ -211,7 +211,7 @@ MonoBehaviour:
   gpuSource: {fileID: 143382747}
   particleRadius: 0.12
   velocityDisplayMax: 6
-  preset: 1
+  preset: 5
   colourMap:
     serializedVersion: 2
     key0: {r: 0.1, g: 0.1, b: 0.12, a: 1}
@@ -243,6 +243,14 @@ MonoBehaviour:
     m_NumColorKeys: 2
     m_NumAlphaKeys: 2
   gradientResolution: 128
+  autoVelocityMax: 1
+  velocityMaxPadding: 0.5
+  velocityMaxSmoothing: 2
+  minVelocityRange: 1
+  impostorLightDirection: {x: -0.4, y: 0.5, z: 0.8}
+  impostorAmbient: 0.35
+  impostorSpecular: 0
+  impostorShininess: 32
 --- !u!114 &143382747
 MonoBehaviour:
   m_ObjectHideFlags: 0

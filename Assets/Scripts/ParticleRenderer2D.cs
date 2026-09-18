@@ -31,6 +31,18 @@ public class ParticleRenderer2D : MonoBehaviour
         Molten,
         Neon,
         Monochrome,
+
+        /// <summary>
+        /// Full-spectrum speed ramp: blue at rest through cyan, green and yellow to
+        /// red at the top. Ordered slow-to-fast, so it reads without a legend.
+        /// </summary>
+        /// <remarks>
+        /// A three-stop blue -> green -> red lerp looks muddy, because green-to-red
+        /// passes through olive and blue-to-green passes through teal: the midpoint
+        /// is desaturated. Going the long way round the wheel keeps every stop
+        /// saturated, which is what makes speed differences legible in fine detail.
+        /// </remarks>
+        SpeedRainbow,
     }
 
     [Header("Source")]
@@ -45,11 +57,35 @@ public class ParticleRenderer2D : MonoBehaviour
     public float particleRadius = 0.12f;
 
     [Tooltip("Speed mapped to the top of the colour gradient. Particles at or " +
-             "above this render as the gradient's final colour.")]
+             "above this render as the gradient's final colour. Ignored when " +
+             "autoVelocityMax is on.")]
     public float velocityDisplayMax = 6f;
 
-    [Tooltip("Ready-made ramp. Pick Custom to use the gradient below instead.")]
-    public ColourPreset preset = ColourPreset.DeepWater;
+    [Tooltip("Derive the top of the colour ramp from the simulation's own peak " +
+             "speed instead of a fixed number. The peak is already reduced every " +
+             "frame for the CFL time step, so this costs nothing, and it removes " +
+             "the failure mode where the fluid outgrows a hand-set maximum and " +
+             "every particle clamps to the same colour.")]
+    public bool autoVelocityMax = true;
+
+    [Tooltip("Peak speed is multiplied by this to leave headroom, so the fastest " +
+             "particles are not pinned to the last gradient stop.")]
+    // Roughly half the peak, because the peak is outlier-dominated: the fastest
+    // particle in a dam break can be several times the median, so mapping the whole
+    // ramp to it leaves the bulk of the fluid compressed into the dark end.
+    [Range(0.2f, 2f)] public float velocityMaxPadding = 0.5f;
+
+    [Tooltip("How quickly the auto range follows the peak, in e-folds per second. " +
+             "Lower is steadier; 0 freezes it.")]
+    public float velocityMaxSmoothing = 2f;
+
+    [Tooltip("Floor for the auto range. Without one, a fluid at rest collapses the " +
+             "ramp to zero and every particle samples the top stop.")]
+    public float minVelocityRange = 1f;
+
+    [Tooltip("Ready-made ramp. Pick Custom to use the gradient below instead. " +
+             "SpeedRainbow is ordered slow-to-fast: blue, green, red.")]
+    public ColourPreset preset = ColourPreset.SpeedRainbow;
 
     [Tooltip("Only used when preset is Custom. Slow at the left, fast at the right.")]
     public Gradient colourMap = DefaultGradient();
@@ -66,7 +102,9 @@ public class ParticleRenderer2D : MonoBehaviour
     [Tooltip("Fraction of the particle colour that survives unlit. 1 disables shading.")]
     [Range(0f, 1f)] public float impostorAmbient = 0.35f;
 
-    [Range(0f, 1f)] public float impostorSpecular = 0.35f;
+    // Off by default: a highlight per particle is a strong "separate spheres" cue,
+    // which is the opposite of what the colour ramp is trying to say.
+    [Range(0f, 1f)] public float impostorSpecular = 0f;
     public float impostorShininess = 32f;
 
     [Header("Screen-space surface")]
@@ -112,6 +150,9 @@ public class ParticleRenderer2D : MonoBehaviour
 
     private ComputeBuffer boundBuffer;
     private int boundCount;
+
+    // Starts at the manual value so the first frames are not mapped 0..0.
+    private float smoothedVelocityMax;
 
     // Screen-space surface resources. Depth is RFloat, not RHalf: the reconstructed
     // normals come from screen-space derivatives of depth, and half precision at a
@@ -175,6 +216,15 @@ public class ParticleRenderer2D : MonoBehaviour
                     new Color(0.35f, 0.36f, 0.40f),
                     new Color(0.70f, 0.72f, 0.78f),
                     new Color(0.97f, 0.98f, 1.00f));
+
+            case ColourPreset.SpeedRainbow:
+                return BuildGradient(
+                    new Color(0.10f, 0.25f, 0.90f),   // slow: blue
+                    new Color(0.15f, 0.75f, 0.95f),   // cyan
+                    new Color(0.20f, 0.90f, 0.35f),   // mid: green
+                    new Color(0.95f, 0.90f, 0.20f),   // yellow
+                    new Color(1.00f, 0.55f, 0.10f),   // orange
+                    new Color(0.95f, 0.12f, 0.10f));  // fast: red
 
             default:
                 return null;
@@ -253,6 +303,8 @@ public class ParticleRenderer2D : MonoBehaviour
 
         if (!EnsureBound(buffer, count)) return;
         if (needsSettingsUpdate) { needsSettingsUpdate = false; UpdateSettings(); }
+
+        UpdateVelocityRange();
 
         EnsureTargets(cam.pixelWidth, cam.pixelHeight);
 
@@ -448,6 +500,43 @@ public class ParticleRenderer2D : MonoBehaviour
     }
 
     /// <summary>
+    /// Points the colour ramp at the range the fluid actually occupies.
+    /// </summary>
+    /// <remarks>
+    /// A fixed top-of-ramp value saturates the moment the fluid moves faster than
+    /// it: every particle above the maximum samples the same final stop, and a
+    /// multi-colour ramp renders as one flat colour. The peak speed is already
+    /// available from SPHCompute's per-frame reduction, so the ramp can follow the
+    /// simulation instead of being guessed.
+    /// </remarks>
+    private void UpdateVelocityRange()
+    {
+        float target = velocityDisplayMax;
+
+        if (autoVelocityMax && gpuSource != null && gpuSource.LastMaxSpeed > 1e-4f)
+        {
+            target = gpuSource.LastMaxSpeed * velocityMaxPadding;
+        }
+
+        target = Mathf.Max(Mathf.Max(0.0001f, minVelocityRange), target);
+
+        if (smoothedVelocityMax <= 0f || target > smoothedVelocityMax * 2f || target < smoothedVelocityMax * 0.5f)
+        {
+            // First frame, or a change too large to ease into: snap. Otherwise a
+            // fluid that starts moving fast spends seconds fading up from the
+            // resting range, and nothing is readable in the meantime.
+            smoothedVelocityMax = target;
+        }
+        else if (velocityMaxSmoothing > 0f)
+        {
+            float k = 1f - Mathf.Exp(-velocityMaxSmoothing * Mathf.Max(0f, Time.deltaTime));
+            smoothedVelocityMax = Mathf.Lerp(smoothedVelocityMax, target, k);
+        }
+
+        material.SetFloat("_VelocityMax", Mathf.Max(0.0001f, smoothedVelocityMax));
+    }
+
+    /// <summary>
     /// Binds <paramref name="buffer"/> and issues one instanced draw.
     /// </summary>
     /// <remarks>
@@ -489,6 +578,8 @@ public class ParticleRenderer2D : MonoBehaviour
             UpdateSettings();
         }
 
+        UpdateVelocityRange();
+
         // Bounds are deliberately huge: the geometry is built in world space from
         // the buffer, so Unity has no way to cull it correctly from the mesh alone.
         var bounds = new Bounds(Vector3.zero, Vector3.one * 10000f);
@@ -498,7 +589,8 @@ public class ParticleRenderer2D : MonoBehaviour
     private void UpdateSettings()
     {
         material.SetFloat("_ParticleRadius", Mathf.Max(0.0001f, particleRadius));
-        material.SetFloat("_VelocityMax", Mathf.Max(0.0001f, velocityDisplayMax));
+
+        // _VelocityMax is owned by UpdateVelocityRange, which runs every frame.
 
         material.SetVector("_LightDir", impostorLightDirection);
         material.SetFloat("_Ambient", impostorAmbient);
