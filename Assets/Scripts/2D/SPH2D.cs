@@ -18,7 +18,7 @@ public class SPH2D : MonoBehaviour
     [Header("Particles")]
     [Tooltip("Total number of particles. Spawning is a blue-noise scatter, so " +
              "there is no grid to describe and no x-by-y split.")]
-    public int particleCount = 400;
+    public int particleCount = 5000;
 
     [Header("Physics")]
     public Vector2 gravity = new Vector2(0f, -9.81f);
@@ -30,10 +30,11 @@ public class SPH2D : MonoBehaviour
     public float smoothingLengthInSpacing = 2.2f;
     [HideInInspector] public float smoothingLength = 2f;
 
-    public int debugParticle = 0;
-
     [Header("Simulation")]
-    public int maxSubSteps = 32;
+    // 5000 particles in the default spawn region gives h = 0.152 and a CFL step of
+    // 0.5-0.7 ms, so keeping up with real time needs ~33 substeps per 60 Hz frame.
+    // The cap has to sit above that or the fluid silently falls behind.
+    public int maxSubSteps = 64;
     [Range(0.05f, 0.5f)] public float cflFactor = 0.25f;
     public float minTimeStep = 0.0002f;
     public float maxTimeStep = 0.02f;
@@ -737,9 +738,6 @@ public class SPH2D : MonoBehaviour
         {
             DrawParticleArrows();
         }
-
-        // 4. Debug: one particle's neighbour connections
-        DrawDebugNeighbors();
     }
 
     private void DrawArrows(float2[] forces, Color weak, Color strong)
@@ -789,31 +787,6 @@ public class SPH2D : MonoBehaviour
 
             Gizmos.color = Color.Lerp(Color.cyan, Color.magenta, Mathf.InverseLerp(0f, maxForce, mag));
             Gizmos.DrawLine(origin, origin + dir * forceArrowLength);
-        }
-    }
-
-    /// <summary>
-    /// Draws only one particle's neighbour connections, so you can tell which
-    /// connections belong to whom. Drawing them all produces an unreadable mesh.
-    /// </summary>
-    private void DrawDebugNeighbors()
-    {
-        if (!neighbors.fluidStart.IsCreated || renderParticles.Length == 0) return;
-
-        int target = Mathf.Clamp(debugParticle, 0, renderParticles.Length - 1);
-
-        Gizmos.color = Color.red;
-        float2 targetPos = renderParticles[target].position;
-        Gizmos.DrawWireSphere(new Vector3(targetPos.x, targetPos.y, 0f), 0.12f);
-
-        Gizmos.color = Color.green;
-
-        for (int k = neighbors.fluidStart[target]; k < neighbors.fluidStart[target + 1]; k++)
-        {
-            float2 otherPos = renderParticles[neighbors.fluid[k]].position;
-            Gizmos.DrawLine(
-                new Vector3(targetPos.x, targetPos.y, 0f),
-                new Vector3(otherPos.x, otherPos.y, 0f));
         }
     }
 

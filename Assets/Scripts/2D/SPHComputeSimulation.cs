@@ -31,7 +31,9 @@ public class SPHComputeSimulation : MonoBehaviour
     public SPHCompute compute;
 
     [Header("Time stepping")]
-    public int maxSubSteps = 32;
+    // Must match SPH2D's cap: 5000 particles need ~33 substeps per frame to keep
+    // up with real time, so 32 would clamp and lose fluid time.
+    public int maxSubSteps = 64;
     [Range(0.05f, 0.5f)] public float cflFactor = 0.25f;
     public float minTimeStep = 0.0002f;
     public float maxTimeStep = 0.02f;

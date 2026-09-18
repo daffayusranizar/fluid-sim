@@ -167,13 +167,13 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::SPH2D
   boxSize: {x: 10, y: 10}
-  particleCount: 400
+  particleCount: 5000
   gravity: {x: 0, y: -9.81}
   collisionDamping: 0.5
   smoothingLengthInSpacing: 2.2
   smoothingLength: 2
   debugParticle: 0
-  maxSubSteps: 32
+  maxSubSteps: 64
   cflFactor: 0.25
   minTimeStep: 0.0002
   maxTimeStep: 0.02
@@ -210,6 +210,8 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::ParticleRenderer2D
   gpuSource: {fileID: 143382747}
   particleRadius: 0.12
+  autoParticleRadius: 1
+  particleRadiusInSpacing: 1.7
   velocityDisplayMax: 6
   preset: 5
   colourMap:
@@ -264,7 +266,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::SPHCompute
   shader: {fileID: 7200000, guid: fd5605c00537460a8d4612d44371e30a, type: 3}
-  particleCapacity: 400
+  particleCapacity: 5000
   boundaryVolume: 0.0625
   verifyOnStart: 0
   keyMode: 0
@@ -283,7 +285,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::SPHComputeSimulation
   source: {fileID: 143382745}
   compute: {fileID: 143382747}
-  maxSubSteps: 32
+  maxSubSteps: 64
   cflFactor: 0.25
   minTimeStep: 0.0002
   maxTimeStep: 0.02

@@ -53,8 +53,20 @@ public class ParticleRenderer2D : MonoBehaviour
     public SPHCompute gpuSource;
 
     [Header("Particle Appearance")]
-    [Tooltip("World-space radius of one particle disc.")]
+    [Tooltip("World-space radius of one particle disc. Ignored when " +
+             "autoParticleRadius is on.")]
     public float particleRadius = 0.12f;
+
+    [Tooltip("Size impostors from the particle spacing instead of a fixed radius. " +
+             "Without this the same number means 'separate dots' at 400 particles " +
+             "and 'one body' at 5000, because the spacing changes with the count.")]
+    public bool autoParticleRadius = true;
+
+    [Tooltip("Impostor radius per unit of particle spacing. The world-space disc " +
+             "radius is half of this. 1.7 makes neighbouring discs overlap by about " +
+             "the spacing, which is what reads as a continuous body rather than " +
+             "as circles that happen to touch.")]
+    public float particleRadiusInSpacing = 1.7f;
 
     [Tooltip("Speed mapped to the top of the colour gradient. Particles at or " +
              "above this render as the gradient's final colour. Ignored when " +
@@ -305,6 +317,7 @@ public class ParticleRenderer2D : MonoBehaviour
         if (needsSettingsUpdate) { needsSettingsUpdate = false; UpdateSettings(); }
 
         UpdateVelocityRange();
+        UpdateParticleRadius();
 
         EnsureTargets(cam.pixelWidth, cam.pixelHeight);
 
@@ -509,6 +522,36 @@ public class ParticleRenderer2D : MonoBehaviour
     /// available from SPHCompute's per-frame reduction, so the ramp can follow the
     /// simulation instead of being guessed.
     /// </remarks>
+    /// <summary>
+    /// Sizes the impostors relative to the particle spacing rather than to a fixed
+    /// world radius.
+    /// </summary>
+    /// <remarks>
+    /// The spacing is h / smoothingLengthInSpacing, so it can be recovered from the
+    /// smoothing length the solver already publishes. This matters for more than
+    /// convenience: whether the fluid reads as a body or as a cloud of dots depends
+    /// on the ratio of disc size to spacing, so a fixed radius silently changes
+    /// meaning every time the particle count changes.
+    /// </remarks>
+    private void UpdateParticleRadius()
+    {
+        float radius = particleRadius;
+
+        if (autoParticleRadius)
+        {
+            float h = gpuSource != null ? gpuSource.SmoothingLength : 0f;
+            if (h <= 0f && sim != null) h = sim.Parameters.smoothingLength;
+
+            if (h > 0f)
+            {
+                float ratio = sim != null ? Mathf.Max(0.01f, sim.smoothingLengthInSpacing) : 2.2f;
+                radius = (h / ratio) * particleRadiusInSpacing;
+            }
+        }
+
+        material.SetFloat("_ParticleRadius", Mathf.Max(0.0001f, radius));
+    }
+
     private void UpdateVelocityRange()
     {
         float target = velocityDisplayMax;
@@ -579,6 +622,7 @@ public class ParticleRenderer2D : MonoBehaviour
         }
 
         UpdateVelocityRange();
+        UpdateParticleRadius();
 
         // Bounds are deliberately huge: the geometry is built in world space from
         // the buffer, so Unity has no way to cull it correctly from the mesh alone.
@@ -588,9 +632,8 @@ public class ParticleRenderer2D : MonoBehaviour
 
     private void UpdateSettings()
     {
-        material.SetFloat("_ParticleRadius", Mathf.Max(0.0001f, particleRadius));
-
-        // _VelocityMax is owned by UpdateVelocityRange, which runs every frame.
+        // _ParticleRadius and _VelocityMax are owned by the per-frame updates, since
+        // both depend on state that only exists once the solver has been seeded.
 
         material.SetVector("_LightDir", impostorLightDirection);
         material.SetFloat("_Ambient", impostorAmbient);

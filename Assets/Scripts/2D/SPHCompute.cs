@@ -73,7 +73,7 @@ public class SPHCompute : MonoBehaviour
     public ComputeShader shader;
 
     [Tooltip("Particle capacity. Buffers are allocated to this by Initialize().")]
-    public int particleCapacity = 400;
+    public int particleCapacity = 5000;
 
     [Tooltip("Scalar the solver uses to weight boundary contributions (spawnSpacing squared).")]
     public float boundaryVolume = 0.0625f;
@@ -156,6 +156,13 @@ public class SPHCompute : MonoBehaviour
 
     public bool IsReady => ready;
     public int ParticleCapacity => particleCapacity;
+
+    /// <summary>
+    /// Smoothing length from the last uploaded parameters, or 0 before any are set.
+    /// The renderer uses it to size impostors from the particle spacing, which is
+    /// h divided by the solver's smoothingLengthInSpacing.
+    /// </summary>
+    public float SmoothingLength => hasParameters ? parameters.smoothingLength : 0f;
 
     /// <summary>
     /// The buffer holding the current particle state. Exposed so the renderer can
