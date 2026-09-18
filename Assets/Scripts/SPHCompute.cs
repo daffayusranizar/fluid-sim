@@ -31,6 +31,9 @@ public class SPHCompute : MonoBehaviour
     private const string ProbeKernelName = "ProbeRoundTrip";
     private const string DensityKernelName = "ComputeDensity";
     private const string PressureKernelName = "ComputePressure";
+    private const string ForceKernelName = "ComputePressureForce";
+    private const string ViscosityKernelName = "ComputeViscosity";
+    private const string IntegrateKernelName = "Integrate";
 
     /// <summary>
     /// Displacement the probe kernel applies to every position. Passed to the
@@ -57,16 +60,21 @@ public class SPHCompute : MonoBehaviour
     private ComputeBuffer particlesOut;
     private ComputeBuffer boundary;
 
-    // Density and pressure, kept out of the Particle struct so no pass writes a
-    // field another thread is reading. See the note in SPH2D.compute.
+    // Density, pressure and force are kept out of the Particle struct so no pass
+    // writes a field another thread is reading. See the note in SPH2D.compute.
     private ComputeBuffer density;
     private ComputeBuffer nearDensity;
     private ComputeBuffer pressure;
     private ComputeBuffer nearPressure;
+    private ComputeBuffer force;
+    private ComputeBuffer viscosityForce;
 
     private int probeKernel = -1;
     private int densityKernel = -1;
     private int pressureKernel = -1;
+    private int forceKernel = -1;
+    private int viscosityKernel = -1;
+    private int integrateKernel = -1;
 
     private int boundaryCapacity;
     private bool ready;
@@ -78,6 +86,7 @@ public class SPHCompute : MonoBehaviour
     // allocate every frame. T-029 removes the readback entirely.
     private Particle2D[] readbackScratch;
     private float[] scalarScratch;
+    private float2[] vectorScratch;
 
     public bool IsReady => ready;
     public int ParticleCapacity => particleCapacity;
@@ -114,7 +123,9 @@ public class SPHCompute : MonoBehaviour
             return false;
         }
 
-        foreach (string name in new[] { ProbeKernelName, DensityKernelName, PressureKernelName })
+        foreach (string name in new[]
+                 { ProbeKernelName, DensityKernelName, PressureKernelName,
+                   ForceKernelName, ViscosityKernelName, IntegrateKernelName })
         {
             if (!shader.HasKernel(name))
             {
@@ -129,6 +140,9 @@ public class SPHCompute : MonoBehaviour
         probeKernel = shader.FindKernel(ProbeKernelName);
         densityKernel = shader.FindKernel(DensityKernelName);
         pressureKernel = shader.FindKernel(PressureKernelName);
+        forceKernel = shader.FindKernel(ForceKernelName);
+        viscosityKernel = shader.FindKernel(ViscosityKernelName);
+        integrateKernel = shader.FindKernel(IntegrateKernelName);
 
         particlesIn = new ComputeBuffer(particleCapacity, ParticleStride, ComputeBufferType.Structured);
         particlesOut = new ComputeBuffer(particleCapacity, ParticleStride, ComputeBufferType.Structured);
@@ -137,6 +151,8 @@ public class SPHCompute : MonoBehaviour
         nearDensity = new ComputeBuffer(particleCapacity, sizeof(float), ComputeBufferType.Structured);
         pressure = new ComputeBuffer(particleCapacity, sizeof(float), ComputeBufferType.Structured);
         nearPressure = new ComputeBuffer(particleCapacity, sizeof(float), ComputeBufferType.Structured);
+        force = new ComputeBuffer(particleCapacity, sizeof(float) * 2, ComputeBufferType.Structured);
+        viscosityForce = new ComputeBuffer(particleCapacity, sizeof(float) * 2, ComputeBufferType.Structured);
 
         // Park a one-element boundary buffer immediately. The kernel reads element
         // zero unconditionally, so it must never be null, and a zero-length
@@ -248,19 +264,78 @@ public class SPHCompute : MonoBehaviour
         shader.Dispatch(pressureKernel, GroupCount(), 1, 1);
     }
 
+    /// <summary>
+    /// Runs the pressure-force pass, then the viscosity pass that adds to it.
+    /// </summary>
+    /// <remarks>
+    /// The order is load-bearing: ComputeViscosity reads _Force and adds to it.
+    /// Unity records dispatches on one queue and puts a UAV barrier between passes
+    /// that touch the same buffer, so sequential Dispatch calls are the GPU
+    /// equivalent of the CPU's JobHandle dependency chain.
+    /// </remarks>
+    public void DispatchForces()
+    {
+        if (!ready || !hasParameters) return;
+
+        SetParameterUniforms();
+
+        shader.SetBuffer(forceKernel, "_ParticlesIn", particlesIn);
+        shader.SetBuffer(forceKernel, "_BoundaryPositions", boundary);
+        shader.SetBuffer(forceKernel, "_Density", density);
+        shader.SetBuffer(forceKernel, "_NearDensity", nearDensity);
+        shader.SetBuffer(forceKernel, "_Pressure", pressure);
+        shader.SetBuffer(forceKernel, "_NearPressure", nearPressure);
+        shader.SetBuffer(forceKernel, "_Force", force);
+        shader.Dispatch(forceKernel, GroupCount(), 1, 1);
+
+        shader.SetBuffer(viscosityKernel, "_ParticlesIn", particlesIn);
+        shader.SetBuffer(viscosityKernel, "_ViscosityForce", viscosityForce);
+        shader.SetBuffer(viscosityKernel, "_Force", force);
+        shader.Dispatch(viscosityKernel, GroupCount(), 1, 1);
+    }
+
+    /// <summary>
+    /// Integrates one step of semi-implicit Euler and writes the new state into
+    /// the output particle buffer.
+    /// </summary>
+    public void DispatchIntegrate(float dt)
+    {
+        if (!ready || !hasParameters) return;
+
+        SetParameterUniforms();
+        shader.SetFloat("_DeltaTime", dt);
+
+        shader.SetBuffer(integrateKernel, "_ParticlesIn", particlesIn);
+        shader.SetBuffer(integrateKernel, "_ParticlesOut", particlesOut);
+        shader.SetBuffer(integrateKernel, "_Density", density);
+        shader.SetBuffer(integrateKernel, "_Force", force);
+        shader.Dispatch(integrateKernel, GroupCount(), 1, 1);
+    }
+
     private void SetParameterUniforms()
     {
         shader.SetInt("_ParticleCount", particleCapacity);
         shader.SetInt("_BoundaryCount", BoundaryCount);
 
         shader.SetFloat("_SmoothingLength", parameters.smoothingLength);
+        shader.SetFloat("_SmoothingLengthSq", parameters.smoothingLengthSq);
         shader.SetFloat("_SpikyPow2Const", parameters.spikyPow2Const);
         shader.SetFloat("_SpikyPow3Const", parameters.spikyPow3Const);
+        shader.SetFloat("_SpikyPow2GradConst", parameters.spikyPow2GradConst);
+        shader.SetFloat("_SpikyPow3GradConst", parameters.spikyPow3GradConst);
+        shader.SetFloat("_Poly6Const", parameters.poly6Const);
         shader.SetFloat("_RestDensity", parameters.restDensity);
         shader.SetFloat("_ParticleMass", parameters.particleMass);
         shader.SetFloat("_BoundaryVolume", parameters.boundaryVolume);
         shader.SetFloat("_NearPressureMultiplier", parameters.nearPressureMultiplier);
         shader.SetFloat("_Stiffness", parameters.stiffness);
+        shader.SetFloat("_Viscosity", parameters.viscosity);
+
+        // float2 has no implicit conversion to Vector4, so widen explicitly.
+        shader.SetVector("_Gravity", new Vector4(parameters.gravity.x, parameters.gravity.y, 0f, 0f));
+        shader.SetVector("_BoxCenter", new Vector4(parameters.boxCenter.x, parameters.boxCenter.y, 0f, 0f));
+        shader.SetVector("_BoxHalfSize", new Vector4(parameters.boxHalfSize.x, parameters.boxHalfSize.y, 0f, 0f));
+        shader.SetFloat("_CollisionDamping", parameters.collisionDamping);
 
         // Bools cross as 0/1, matching how the CPU treats them. HLSL has no
         // fixed-size bool, which is the same reason SolverParams needs
@@ -330,6 +405,36 @@ public class SPHCompute : MonoBehaviour
 
         buffer.GetData(scalarScratch, 0, 0, particleCapacity);
         NativeArray<float>.Copy(scalarScratch, into, particleCapacity);
+    }
+
+    /// <summary>
+    /// Reads back the two force vector buffers. Each destination must hold the
+    /// whole buffer.
+    /// </summary>
+    public void ReadbackForce(NativeArray<float2> outForce, NativeArray<float2> outViscosityForce)
+    {
+        if (!ready) return;
+
+        ReadVector(force, outForce);
+        ReadVector(viscosityForce, outViscosityForce);
+    }
+
+    private void ReadVector(ComputeBuffer buffer, NativeArray<float2> into)
+    {
+        if (into.Length < particleCapacity)
+        {
+            Debug.LogError($"SPHCompute.ReadbackForce: destination has {into.Length} slots " +
+                           $"but the buffer holds {particleCapacity}.");
+            return;
+        }
+
+        if (vectorScratch == null || vectorScratch.Length != particleCapacity)
+        {
+            vectorScratch = new float2[particleCapacity];
+        }
+
+        buffer.GetData(vectorScratch, 0, 0, particleCapacity);
+        NativeArray<float2>.Copy(vectorScratch, into, particleCapacity);
     }
 
     /// <summary>
@@ -445,6 +550,8 @@ public class SPHCompute : MonoBehaviour
         nearDensity?.Release();
         pressure?.Release();
         nearPressure?.Release();
+        force?.Release();
+        viscosityForce?.Release();
 
         particlesIn = null;
         particlesOut = null;
@@ -454,6 +561,8 @@ public class SPHCompute : MonoBehaviour
         nearDensity = null;
         pressure = null;
         nearPressure = null;
+        force = null;
+        viscosityForce = null;
 
         boundaryCapacity = 0;
         BoundaryCount = 0;
@@ -461,9 +570,13 @@ public class SPHCompute : MonoBehaviour
         probeKernel = -1;
         densityKernel = -1;
         pressureKernel = -1;
+        forceKernel = -1;
+        viscosityKernel = -1;
+        integrateKernel = -1;
 
         readbackScratch = null;
         scalarScratch = null;
+        vectorScratch = null;
 
         hasParameters = false;
         ready = false;

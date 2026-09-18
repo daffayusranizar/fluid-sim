@@ -1,10 +1,9 @@
 // GPU-side SPH pipeline.
 //
 // T-026 built the plumbing: the particle struct, the buffers, and a round-trip
-// probe. T-027 adds the first physics -- density and pressure -- as two kernels
-// that mirror the CPU's two jobs one for one, so the two can be compared on
-// identical input. Forces and integration arrive in T-028, and the removal of
-// the per-frame readback in T-029.
+// probe. T-027 added density and pressure as two kernels mirroring the CPU's two
+// jobs. T-028 completes the physics: pressure force, XSPH viscosity, and
+// integration. T-029 removes the per-frame readback.
 //
 // The struct must match Particle2D field for field. HLSL packs each float2 at
 // its natural 8-byte alignment, which lands every field at the same offset the
@@ -21,6 +20,9 @@
 #pragma kernel ProbeRoundTrip
 #pragma kernel ComputeDensity
 #pragma kernel ComputePressure
+#pragma kernel ComputePressureForce
+#pragma kernel ComputeViscosity
+#pragma kernel Integrate
 
 struct Particle
 {
@@ -48,26 +50,43 @@ StructuredBuffer<float2> _BoundaryPositions;
 // a field that thread j reads while computing its density. The value read is not
 // one this pass uses, so the race would be benign -- which is exactly the kind of
 // "benign" the CPU side removed in T-024 by moving to separate arrays. Same
-// reasoning, same answer.
+// reasoning, same answer. Force gets the same treatment for the same reason: the
+// force pass reads every particle's position and writes only its own force.
 RWStructuredBuffer<float> _Density;
 RWStructuredBuffer<float> _NearDensity;
 RWStructuredBuffer<float> _Pressure;
 RWStructuredBuffer<float> _NearPressure;
+RWStructuredBuffer<float2> _Force;
+
+// The XSPH part of the force, kept separate for the debug arrows and so the
+// viscosity contribution can be diffed on its own against the CPU.
+RWStructuredBuffer<float2> _ViscosityForce;
 
 uint _ParticleCount;
 uint _BoundaryCount;
 
 // --- Solver parameters, mirroring SolverParams on the CPU ---
 float _SmoothingLength;
+float _SmoothingLengthSq;
 float _SpikyPow2Const;      // main channel density
 float _SpikyPow3Const;      // near channel density
+float _SpikyPow2GradConst;  // main channel force
+float _SpikyPow3GradConst;  // near channel force
+float _Poly6Const;          // viscosity weight
 float _RestDensity;
 float _ParticleMass;
 float _BoundaryVolume;
 float _NearPressureMultiplier;
 float _Stiffness;
+float _Viscosity;
 uint _ClampPressurePositive;
 uint _UseBoundaryParticles;
+
+float2 _Gravity;
+float2 _BoxCenter;
+float2 _BoxHalfSize;
+float _CollisionDamping;
+float _DeltaTime;
 
 float2 _ProbeOffset;
 
@@ -88,6 +107,35 @@ float SpikyPow3Kernel(float r, float h, float k)
     if (r >= h) return 0.0;
     float hr = h - r;
     return k * hr * hr * hr;
+}
+
+// NOTE: unlike the value kernels above, the gradient functions have no r >= h
+// early-out -- matching SPHMath.cs, where SpikyPow2GradientMagnitude returns a
+// negative (h - r) beyond h. On the CPU that never matters, because the caller
+// reaches these through the neighbour grid, so r < h is already guaranteed by
+// construction. Here the loop is brute force, so the r < h test has to be made
+// explicitly at each call site. Miss it and the force is silently wrong in a way
+// that still looks like a fluid.
+float SpikyPow2GradientMagnitude(float r, float h, float k)
+{
+    return k * (h - r);
+}
+
+float SpikyPow3GradientMagnitude(float r, float h, float k)
+{
+    float hr = h - r;
+    return k * hr * hr;
+}
+
+/// XSPH viscosity weight. Non-negative everywhere, which is the property that
+/// matters: a weighted average toward neighbours' velocities cannot add energy
+/// no matter how tightly particles are packed. Muller's Laplacian formulation
+/// needs a dedicated kernel precisely because a Laplacian can change sign.
+float Poly6Kernel(float r2, float h2, float k)
+{
+    if (r2 >= h2) return 0.0;
+    float diff = h2 - r2;
+    return k * diff * diff * diff;
 }
 
 /// Tait equation of state, linear form. The clamp is a flag, not a constant:
@@ -191,4 +239,186 @@ void ComputePressure(uint3 id : SV_DispatchThreadID)
 
     _Pressure[i] = TaitPressure(_Density[i], _ClampPressurePositive != 0);
     _NearPressure[i] = NearPressure(_NearDensity[i]);
+}
+
+// ----------------------------------------------------------------------
+// Pressure force (T-028)
+// ----------------------------------------------------------------------
+
+/// Forces are assigned, not accumulated, so no reset pass is needed. The CPU
+/// still has ResetForcesJob because the force stage used to accumulate; with
+/// `force[i] = accumulated` it is now redundant there too.
+[numthreads(64, 1, 1)]
+void ComputePressureForce(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount) return;
+
+    float h = _SmoothingLength;
+    float h2 = h * h;
+    float2 posI = _ParticlesIn[i].position;
+    float2 accumulated = 0.0;
+
+    for (uint j = 0; j < _ParticleCount; j++)
+    {
+        if (j == i) continue;
+
+        float2 rVec = posI - _ParticlesIn[j].position;
+        float r2 = dot(rVec, rVec);
+
+        // The explicit r < h test that the neighbour grid normally provides.
+        if (r2 >= h2 || r2 <= 0.0) continue;
+
+        float r = sqrt(r2);
+        float2 dir = rVec / r;
+
+        // Main channel: symmetrised Tait pressure over the linear SpikyPow2
+        // gradient. This one can be attractive.
+        float otherDensity = _Density[j];
+        if (otherDensity > 0.0001)
+        {
+            float sharedPressure = (_Pressure[i] + _Pressure[j]) * 0.5;
+
+            accumulated += dir * (_ParticleMass
+                                  * SpikyPow2GradientMagnitude(r, h, _SpikyPow2GradConst)
+                                  * sharedPressure / otherDensity);
+        }
+
+        // Near channel: always repulsive, short range only. This is what keeps
+        // the fluid from collapsing when the main term goes negative.
+        float otherNearDensity = _NearDensity[j];
+        if (otherNearDensity > 0.0001)
+        {
+            float sharedNearPressure = (_NearPressure[i] + _NearPressure[j]) * 0.5;
+
+            accumulated += dir * (_ParticleMass
+                                  * SpikyPow3GradientMagnitude(r, h, _SpikyPow3GradConst)
+                                  * sharedNearPressure / otherNearDensity);
+        }
+    }
+
+    // The wall may push but never pull. Mirroring copies this particle's own
+    // pressure, and that value is often negative near a wall where density is
+    // below rest. A mirrored negative pressure would make the boundary
+    // attractive, so it is clamped -- unconditionally, and independently of
+    // _ClampPressurePositive, exactly as the CPU does.
+    if (_UseBoundaryParticles != 0)
+    {
+        float boundaryPressure = max(0.0, _Pressure[i]);
+
+        for (uint b = 0; b < _BoundaryCount; b++)
+        {
+            float2 rVec = posI - _BoundaryPositions[b];
+            float r2 = dot(rVec, rVec);
+            if (r2 >= h2 || r2 <= 0.0) continue;
+
+            float r = sqrt(r2);
+            float2 dir = rVec / r;
+
+            accumulated += dir * (_BoundaryVolume * boundaryPressure
+                                  * SpikyPow2GradientMagnitude(r, h, _SpikyPow2GradConst));
+        }
+    }
+
+    _Force[i] = accumulated;
+}
+
+// ----------------------------------------------------------------------
+// Viscosity (T-028)
+// ----------------------------------------------------------------------
+
+/// Reads _Force and adds to it, so this must be dispatched after
+/// ComputePressureForce. Dispatches on one queue are ordered on the GPU with a
+/// UAV barrier between them, which plays the role the job dependency played on
+/// the CPU.
+[numthreads(64, 1, 1)]
+void ComputeViscosity(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount) return;
+
+    float2 posI = _ParticlesIn[i].position;
+    float2 velI = _ParticlesIn[i].velocity;
+    float2 viscForce = 0.0;
+
+    for (uint j = 0; j < _ParticleCount; j++)
+    {
+        if (j == i) continue;
+
+        float2 rVec = _ParticlesIn[j].position - posI;
+        float r2 = dot(rVec, rVec);
+
+        // XSPH: Poly6 is a weight on the velocity difference, not a Laplacian.
+        // Being non-negative everywhere it can only pull this velocity toward
+        // its neighbours', so there is no sign to get wrong and no way for the
+        // term to add energy. It also needs no square root. The kernel's own
+        // r2 >= h2 early-out is the neighbour restriction here.
+        viscForce += (_ParticlesIn[j].velocity - velI)
+                     * Poly6Kernel(r2, _SmoothingLengthSq, _Poly6Const);
+    }
+
+    _ViscosityForce[i] = viscForce;
+    _Force[i] += viscForce * _Viscosity;
+}
+
+// ----------------------------------------------------------------------
+// Integration (T-028)
+// ----------------------------------------------------------------------
+
+/// Semi-implicit Euler, then the wall clamp. The clamp is only a penetration
+/// safety net -- wall physics is the boundary particles' job -- but it
+/// guarantees nothing escapes if a step overshoots.
+[numthreads(64, 1, 1)]
+void Integrate(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount) return;
+
+    float particleDensity = _Density[i];
+
+    // Isolation guard, matching the CPU: a particle with no density has no
+    // acceleration to integrate, so it passes through unchanged rather than
+    // being divided by (almost) zero. Writing the input through is the same as
+    // the CPU's early return, because the CPU integrates in place.
+    if (particleDensity <= 0.0001)
+    {
+        _ParticlesOut[i] = _ParticlesIn[i];
+        return;
+    }
+
+    Particle p = _ParticlesIn[i];
+
+    float2 acceleration = _Force[i] / particleDensity + _Gravity;
+    float2 v = p.velocity + acceleration * _DeltaTime;
+    float2 pos = p.position + v * _DeltaTime;
+
+    float relX = pos.x - _BoxCenter.x;
+    float relY = pos.y - _BoxCenter.y;
+
+    if (relX > _BoxHalfSize.x)
+    {
+        pos.x = _BoxCenter.x + _BoxHalfSize.x;
+        v.x *= -_CollisionDamping;
+    }
+    else if (relX < -_BoxHalfSize.x)
+    {
+        pos.x = _BoxCenter.x - _BoxHalfSize.x;
+        v.x *= -_CollisionDamping;
+    }
+
+    if (relY > _BoxHalfSize.y)
+    {
+        pos.y = _BoxCenter.y + _BoxHalfSize.y;
+        v.y *= -_CollisionDamping;
+    }
+    else if (relY < -_BoxHalfSize.y)
+    {
+        pos.y = _BoxCenter.y - _BoxHalfSize.y;
+        v.y *= -_CollisionDamping;
+    }
+
+    p.velocity = v;
+    p.position = pos;
+
+    _ParticlesOut[i] = p;
 }
