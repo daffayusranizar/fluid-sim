@@ -129,6 +129,7 @@ GameObject:
   m_Component:
   - component: {fileID: 143382744}
   - component: {fileID: 143382745}
+  - component: {fileID: 143382746}
   m_Layer: 0
   m_Name: FluidSim
   m_TagString: Untagged
@@ -164,28 +165,49 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::SPH2D
   boxSize: {x: 10, y: 10}
-  numToSpawn: {x: 10, y: 10}
-  spawnCenter: {x: 0, y: 2}
-  particleSpacing: 0.4
+  particleCount: 400
   gravity: {x: 0, y: -9.81}
   collisionDamping: 0.5
-  smoothingLength: 1
+  smoothingLengthInSpacing: 2.2
   debugParticle: 0
-  subSteps: 8
-  restDensity: 10
+  maxSubSteps: 32
+  cflFactor: 0.25
+  minTimeStep: 0.0002
+  maxTimeStep: 0.02
+  batchCount: 64
+  spawnRegionSize: {x: 0.3, y: 0.8}
+  spawnRegionCenter: {x: -1, y: 0}
+  restDensity: 1000
   autoParticleMass: 1
-  particleMass: 0.1
-  stiffness: 100
-  clampPressurePositive: 1
+  spawnCompression: 1
+  particleMass: 1
+  stiffness: 2000
+  clampPressurePositive: 0
+  nearPressureMultiplier: 20
   showPressureColor: 1
-  useRandomSpawn: 1
+  viscosity: 50
+  useBoundaryParticles: 1
   debugLogs: 0
   showForceArrows: 1
+  showViscosityArrows: 0
   forceArrowLength: 0.4
-  showPressureHeatMap: 1
-  heatMapResolution: 40
-  heatMapBlur: 1.5
-  heatMapOpacity: 0.6
+  showParticleGizmos: 1
+--- !u!114 &143382746
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 143382743}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: d58f282692b14e9d9535533d65bf1e00, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::ParticleRenderer2D
+  particleRadius: 0.12
+  velocityDisplayMax: 6
+  preset: 1
+  gradientResolution: 128
 --- !u!1 &330585543
 GameObject:
   m_ObjectHideFlags: 0
@@ -245,7 +267,7 @@ Camera:
     width: 1
     height: 1
   near clip plane: 0.3
-  far clip plane: 10
+  far clip plane: 50
   field of view: 60
   orthographic: 1
   orthographic size: 6
