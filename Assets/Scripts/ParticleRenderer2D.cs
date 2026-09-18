@@ -56,6 +56,18 @@ public class ParticleRenderer2D : MonoBehaviour
     [Tooltip("Width of the gradient texture. Higher gives a smoother ramp.")]
     public int gradientResolution = 128;
 
+    [Header("Impostor Shading")]
+    [Tooltip("Direction the impostor light comes from, in world space. It needs a " +
+             "positive Z to light the face pointing at the camera, which is where " +
+             "the hemisphere normals point.")]
+    public Vector3 impostorLightDirection = new Vector3(-0.4f, 0.5f, 0.8f);
+
+    [Tooltip("Fraction of the particle colour that survives unlit. 1 disables shading.")]
+    [Range(0f, 1f)] public float impostorAmbient = 0.35f;
+
+    [Range(0f, 1f)] public float impostorSpecular = 0.35f;
+    public float impostorShininess = 32f;
+
     /// <summary>Bytes per particle. Must match the shader's Particle struct.</summary>
     private const int ParticleStride = sizeof(float) * 10;
 
@@ -268,6 +280,11 @@ public class ParticleRenderer2D : MonoBehaviour
     {
         material.SetFloat("_ParticleRadius", Mathf.Max(0.0001f, particleRadius));
         material.SetFloat("_VelocityMax", Mathf.Max(0.0001f, velocityDisplayMax));
+
+        material.SetVector("_LightDir", impostorLightDirection);
+        material.SetFloat("_Ambient", impostorAmbient);
+        material.SetFloat("_Specular", impostorSpecular);
+        material.SetFloat("_Shininess", impostorShininess);
 
         Gradient ramp = GradientForPreset(preset) ?? colourMap;
         TextureFromGradient(ref gradientTexture, gradientResolution, ramp);
