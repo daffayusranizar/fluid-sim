@@ -254,6 +254,18 @@ Task Code: T-031
 * Quest : Implement GPU count sort and prefix scan to build the spatial grid.
 * Guide : Implement a 3-pass GPU sort: (1) clear and count particles per cell using atomics, (2) compute prefix sums to get cell start offsets, (3) scatter particles into sorted arrays. Study Blelloch scan and why prefix sums are needed for O(N) grid construction.
 * Done : The spatial grid is built correctly on GPU. Downstream kernels can query _CellStart and _CellEnd for any hash bucket.
+* Note : The Guide scopes this task to *building* the structure ("kernels **can** query"). Building it alone would have been another zero-payoff task -- T-030 produced keys and changed nothing -- so this task also rewires the three O(N^2) kernels to walk their 3x3 cell neighbourhood. Two things had to be right for that to be equivalent. (1) **Boundary particles are packed into the same index space** after the fluid particles, mirroring the CPU grid's scheme. Leaving them out keeps the force kernel's wall loop at O(N*B), and `B ~ sqrt(N)` makes that O(N^1.5) -- only ~3% of the old cost at N=10k, but the dominant term once the fluid query is fixed. (2) **Out-of-grid cells are skipped, never clamped.** `KeyForCell` clamps, so a query that clamped would make an edge particle scan the same bucket up to four times and double-count its occupants; the CPU grid skips for the same reason. Measured, brute force -> gridded, with `h` derived per N:
+
+| N | brute force | gridded | speedup |
+|---|---|---|---|
+| 400 | 1.29 ms | 0.54 ms | 2.4x |
+| 2000 | 3.18 ms | 0.64 ms | 5.0x |
+| 5000 | 6.57 ms | 0.63 ms | 10.4x |
+| 10000 | 29.25 ms | 1.05 ms | **27.8x** |
+| 20000 | -- | 1.75 ms | -- |
+| 50000 | -- | 3.65 ms | -- |
+
+Scaling is now roughly linear in N instead of quadratic. The prefix sum is a single tiled workgroup scan; `bucketCount ~ N/4.8` (2.3k at N=10k), so a multi-workgroup scan would only pay off an order of magnitude higher. The T-029 brute-force numbers used one `h` for all N; brute force is `h`-independent so the comparison holds, but the gridded timings are only meaningful with `h` derived per N.
 
 Task Code: T-032
 * Quest : Render particles as smooth disks using GPU instancing instead of Gizmos.

@@ -41,6 +41,10 @@ public class SPHCompute : MonoBehaviour
     private const string ClearExtremesKernelName = "ClearExtremes";
     private const string ReduceExtremesKernelName = "ReduceExtremes";
     private const string CellKeysKernelName = "ComputeCellKeys";
+    private const string ClearBucketsKernelName = "ClearBuckets";
+    private const string CountBucketsKernelName = "CountBuckets";
+    private const string PrefixSumKernelName = "PrefixSumBuckets";
+    private const string ScatterKernelName = "ScatterParticles";
 
     /// <summary>How a cell coordinate is turned into a bucket index.</summary>
     public enum CellKeyMode
@@ -108,6 +112,14 @@ public class SPHCompute : MonoBehaviour
     private ComputeBuffer cellKeys;
     private ComputeBuffer cellCoords;
 
+    // Count-sort output: bucket b owns sortedIndices[bucketStart[b] .. bucketStart[b+1]].
+    private ComputeBuffer bucketStart;
+    private ComputeBuffer bucketCursor;
+    private ComputeBuffer sortedIndices;
+
+    private int gridTotalCount;
+    private int gridBucketCount;
+
     private int probeKernel = -1;
     private int densityKernel = -1;
     private int pressureKernel = -1;
@@ -117,6 +129,10 @@ public class SPHCompute : MonoBehaviour
     private int clearExtremesKernel = -1;
     private int reduceExtremesKernel = -1;
     private int cellKeysKernel = -1;
+    private int clearBucketsKernel = -1;
+    private int countBucketsKernel = -1;
+    private int prefixSumKernel = -1;
+    private int scatterKernel = -1;
 
     private int boundaryCapacity;
     private bool ready;
@@ -135,6 +151,8 @@ public class SPHCompute : MonoBehaviour
     private uint[] extremesScratch;
     private uint[] keyScratch;
     private int2[] coordScratch;
+    private uint[] bucketScratch;
+    private uint[] indexScratch;
 
     public bool IsReady => ready;
     public int ParticleCapacity => particleCapacity;
@@ -160,6 +178,14 @@ public class SPHCompute : MonoBehaviour
     public int BucketCount => keyMode == CellKeyMode.SpatialHash
         ? hashTableSize
         : GridCols * GridRows;
+
+    /// <summary>Boundary particles actually participating in the grid.</summary>
+    public int EffectiveBoundaryCount => (hasParameters && parameters.useBoundaryParticles)
+        ? BoundaryCount
+        : 0;
+
+    /// <summary>Packed particle count: fluid first, then boundary.</summary>
+    public int TotalCount => particleCapacity + EffectiveBoundaryCount;
 
     private ComputeBuffer ParticlesIn => particleBuffers[current];
     private ComputeBuffer ParticlesOut => particleBuffers[1 - current];
@@ -200,7 +226,8 @@ public class SPHCompute : MonoBehaviour
                      ProbeKernelName, DensityKernelName, PressureKernelName,
                      ForceKernelName, ViscosityKernelName, IntegrateKernelName,
                      ClearExtremesKernelName, ReduceExtremesKernelName,
-                     CellKeysKernelName,
+                     CellKeysKernelName, ClearBucketsKernelName, CountBucketsKernelName,
+                     PrefixSumKernelName, ScatterKernelName,
                  })
         {
             if (!shader.HasKernel(name))
@@ -223,6 +250,10 @@ public class SPHCompute : MonoBehaviour
         clearExtremesKernel = shader.FindKernel(ClearExtremesKernelName);
         reduceExtremesKernel = shader.FindKernel(ReduceExtremesKernelName);
         cellKeysKernel = shader.FindKernel(CellKeysKernelName);
+        clearBucketsKernel = shader.FindKernel(ClearBucketsKernelName);
+        countBucketsKernel = shader.FindKernel(CountBucketsKernelName);
+        prefixSumKernel = shader.FindKernel(PrefixSumKernelName);
+        scatterKernel = shader.FindKernel(ScatterKernelName);
 
         particleBuffers[0] = new ComputeBuffer(particleCapacity, ParticleStride, ComputeBufferType.Structured);
         particleBuffers[1] = new ComputeBuffer(particleCapacity, ParticleStride, ComputeBufferType.Structured);
@@ -236,9 +267,6 @@ public class SPHCompute : MonoBehaviour
         viscosityForce = new ComputeBuffer(particleCapacity, sizeof(float) * 2, ComputeBufferType.Structured);
 
         extremes = new ComputeBuffer(2, sizeof(uint), ComputeBufferType.Structured);
-
-        cellKeys = new ComputeBuffer(particleCapacity, sizeof(uint), ComputeBufferType.Structured);
-        cellCoords = new ComputeBuffer(particleCapacity, sizeof(int) * 2, ComputeBufferType.Structured);
 
         if (hashTableSize <= 0) hashTableSize = 2 * particleCapacity + 1;
 
@@ -333,6 +361,7 @@ public class SPHCompute : MonoBehaviour
     {
         if (!ready || !hasParameters) return;
 
+        BuildGrid();
         DispatchDensityPressure();
         DispatchForces();
         DispatchReduceExtremes();
@@ -381,10 +410,18 @@ public class SPHCompute : MonoBehaviour
     {
         if (!ready || !hasParameters) return;
 
+        if (bucketStart == null)
+        {
+            Debug.LogError("SPHCompute: BuildGrid() must run before the query passes.");
+            return;
+        }
+
         SetParameterUniforms();
 
         shader.SetBuffer(densityKernel, "_ParticlesIn", ParticlesIn);
         shader.SetBuffer(densityKernel, "_BoundaryPositions", boundary);
+        shader.SetBuffer(densityKernel, "_BucketStart", bucketStart);
+        shader.SetBuffer(densityKernel, "_SortedIndices", sortedIndices);
         shader.SetBuffer(densityKernel, "_Density", density);
         shader.SetBuffer(densityKernel, "_NearDensity", nearDensity);
         shader.Dispatch(densityKernel, GroupCount(), 1, 1);
@@ -409,10 +446,18 @@ public class SPHCompute : MonoBehaviour
     {
         if (!ready || !hasParameters) return;
 
+        if (bucketStart == null)
+        {
+            Debug.LogError("SPHCompute: BuildGrid() must run before the query passes.");
+            return;
+        }
+
         SetParameterUniforms();
 
         shader.SetBuffer(forceKernel, "_ParticlesIn", ParticlesIn);
         shader.SetBuffer(forceKernel, "_BoundaryPositions", boundary);
+        shader.SetBuffer(forceKernel, "_BucketStart", bucketStart);
+        shader.SetBuffer(forceKernel, "_SortedIndices", sortedIndices);
         shader.SetBuffer(forceKernel, "_Density", density);
         shader.SetBuffer(forceKernel, "_NearDensity", nearDensity);
         shader.SetBuffer(forceKernel, "_Pressure", pressure);
@@ -421,6 +466,8 @@ public class SPHCompute : MonoBehaviour
         shader.Dispatch(forceKernel, GroupCount(), 1, 1);
 
         shader.SetBuffer(viscosityKernel, "_ParticlesIn", ParticlesIn);
+        shader.SetBuffer(viscosityKernel, "_BucketStart", bucketStart);
+        shader.SetBuffer(viscosityKernel, "_SortedIndices", sortedIndices);
         shader.SetBuffer(viscosityKernel, "_ViscosityForce", viscosityForce);
         shader.SetBuffer(viscosityKernel, "_Force", force);
         shader.Dispatch(viscosityKernel, GroupCount(), 1, 1);
@@ -448,24 +495,24 @@ public class SPHCompute : MonoBehaviour
     /// Maps every particle to a cell coordinate and then to a bucket key. This is
     /// the input the T-031 count sort consumes.
     /// </summary>
+    /// <summary>
+    /// Maps every particle to a cell coordinate and a bucket key. Exposed
+    /// separately from <see cref="BuildGrid"/> so the mapping can be verified on
+    /// its own; the full build also clears, counts, scans and scatters.
+    /// </summary>
     public void DispatchCellKeys()
     {
         if (!ready || !hasParameters) return;
 
         ComputeGridGeometry();
-
-        shader.SetInt("_ParticleCount", particleCapacity);
-        shader.SetFloat("_CellSize", CellSize);
-        shader.SetVector("_GridOrigin", new Vector4(GridOrigin.x, GridOrigin.y, 0f, 0f));
-        shader.SetInt("_GridCols", GridCols);
-        shader.SetInt("_GridRows", GridRows);
-        shader.SetInt("_HashTableSize", hashTableSize);
-        shader.SetInt("_KeyMode", (int)keyMode);
+        EnsureGridBuffers();
+        SetGridUniforms();
 
         shader.SetBuffer(cellKeysKernel, "_ParticlesIn", ParticlesIn);
+        shader.SetBuffer(cellKeysKernel, "_BoundaryPositions", boundary);
         shader.SetBuffer(cellKeysKernel, "_CellKeys", cellKeys);
         shader.SetBuffer(cellKeysKernel, "_CellCoords", cellCoords);
-        shader.Dispatch(cellKeysKernel, GroupCount(), 1, 1);
+        shader.Dispatch(cellKeysKernel, GroupCountFor(TotalCount), 1, 1);
     }
 
     /// <summary>
@@ -478,6 +525,103 @@ public class SPHCompute : MonoBehaviour
     /// exactly h, for the same reason as the CPU grid: the 3x3 query is only
     /// guaranteed complete when cell size is >= h.
     /// </remarks>
+    /// <summary>
+    /// Rebuilds the spatial structure for the current particle positions.
+    /// </summary>
+    /// <remarks>
+    /// Five passes, the classic count sort:
+    ///
+    ///   keys -> clear -> histogram -> prefix sum -> scatter
+    ///
+    /// Rebuilt every step because fluid particles move. Boundary particles are
+    /// static and are re-sorted along with them; at these sizes that is cheaper
+    /// than the bookkeeping needed to keep them separate.
+    /// </remarks>
+    public void BuildGrid()
+    {
+        if (!ready || !hasParameters) return;
+
+        ComputeGridGeometry();
+        EnsureGridBuffers();
+        SetGridUniforms();
+
+        int particleGroups = GroupCountFor(TotalCount);
+
+        // 1. keys: cell coordinate and bucket per packed particle
+        shader.SetBuffer(cellKeysKernel, "_ParticlesIn", ParticlesIn);
+        shader.SetBuffer(cellKeysKernel, "_BoundaryPositions", boundary);
+        shader.SetBuffer(cellKeysKernel, "_CellKeys", cellKeys);
+        shader.SetBuffer(cellKeysKernel, "_CellCoords", cellCoords);
+        shader.Dispatch(cellKeysKernel, particleGroups, 1, 1);
+
+        // 2. clear
+        shader.SetBuffer(clearBucketsKernel, "_BucketStart", bucketStart);
+        shader.Dispatch(clearBucketsKernel, GroupCountFor(gridBucketCount), 1, 1);
+
+        // 3. histogram
+        shader.SetBuffer(countBucketsKernel, "_CellKeys", cellKeys);
+        shader.SetBuffer(countBucketsKernel, "_BucketStart", bucketStart);
+        shader.Dispatch(countBucketsKernel, particleGroups, 1, 1);
+
+        // 4. exclusive prefix sum, one workgroup tiled internally
+        shader.SetBuffer(prefixSumKernel, "_BucketStart", bucketStart);
+        shader.SetBuffer(prefixSumKernel, "_BucketCursor", bucketCursor);
+        shader.Dispatch(prefixSumKernel, 1, 1, 1);
+
+        // 5. scatter
+        shader.SetBuffer(scatterKernel, "_CellKeys", cellKeys);
+        shader.SetBuffer(scatterKernel, "_BucketStart", bucketStart);
+        shader.SetBuffer(scatterKernel, "_BucketCursor", bucketCursor);
+        shader.SetBuffer(scatterKernel, "_SortedIndices", sortedIndices);
+        shader.Dispatch(scatterKernel, particleGroups, 1, 1);
+    }
+
+    private void EnsureGridBuffers()
+    {
+        int total = TotalCount;
+        int buckets = BucketCount;
+
+        if (cellKeys != null && gridTotalCount >= total && gridBucketCount == buckets) return;
+
+        cellKeys?.Release();
+        cellCoords?.Release();
+        sortedIndices?.Release();
+        bucketStart?.Release();
+        bucketCursor?.Release();
+
+        cellKeys = new ComputeBuffer(total, sizeof(uint), ComputeBufferType.Structured);
+        cellCoords = new ComputeBuffer(total, sizeof(int) * 2, ComputeBufferType.Structured);
+        sortedIndices = new ComputeBuffer(total, sizeof(uint), ComputeBufferType.Structured);
+
+        // One extra slot holds the running total, so the last bucket's end needs
+        // no special case in the query.
+        bucketStart = new ComputeBuffer(buckets + 1, sizeof(uint), ComputeBufferType.Structured);
+        bucketCursor = new ComputeBuffer(buckets, sizeof(uint), ComputeBufferType.Structured);
+
+        gridTotalCount = total;
+        gridBucketCount = buckets;
+    }
+
+    private void SetGridUniforms()
+    {
+        shader.SetInt("_ParticleCount", particleCapacity);
+        shader.SetInt("_BoundaryCount", BoundaryCount);
+        shader.SetInt("_TotalCount", TotalCount);
+        shader.SetInt("_BucketCount", gridBucketCount);
+
+        shader.SetFloat("_CellSize", CellSize);
+        shader.SetVector("_GridOrigin", new Vector4(GridOrigin.x, GridOrigin.y, 0f, 0f));
+        shader.SetInt("_GridCols", GridCols);
+        shader.SetInt("_GridRows", GridRows);
+        shader.SetInt("_HashTableSize", hashTableSize);
+        shader.SetInt("_KeyMode", (int)keyMode);
+    }
+
+    private int GroupCountFor(int elementCount)
+    {
+        return Mathf.Max(1, (elementCount + ThreadGroupSize - 1) / ThreadGroupSize);
+    }
+
     private void ComputeGridGeometry()
     {
         CellSize = math.max(0.0001f, parameters.smoothingLength);
@@ -745,6 +889,77 @@ public class SPHCompute : MonoBehaviour
     }
 
     // ------------------------------------------------------------------
+    /// <summary>
+    /// Reads back the bucket offsets: <c>BucketCount + 1</c> entries, where entry
+    /// <c>b</c> is the first slot of bucket <c>b</c>'s run and the final entry is
+    /// the total. Test and diagnostic use only.
+    /// </summary>
+    public void ReadbackBucketStart(NativeArray<uint> outStarts)
+    {
+        if (!ready || bucketStart == null) return;
+
+        int count = gridBucketCount + 1;
+
+        if (outStarts.Length < count)
+        {
+            Debug.LogError($"SPHCompute.ReadbackBucketStart: destination has {outStarts.Length} " +
+                           $"slots but the buffer holds {count}.");
+            return;
+        }
+
+        if (bucketScratch == null || bucketScratch.Length < count) bucketScratch = new uint[count];
+
+        bucketStart.GetData(bucketScratch, 0, 0, count);
+        NativeArray<uint>.Copy(bucketScratch, outStarts, count);
+    }
+
+    /// <summary>Reads back the sorted packed particle indices. Test and diagnostic use only.</summary>
+    public void ReadbackSortedIndices(NativeArray<uint> outIndices)
+    {
+        if (!ready || sortedIndices == null) return;
+
+        int count = gridTotalCount;
+
+        if (outIndices.Length < count)
+        {
+            Debug.LogError($"SPHCompute.ReadbackSortedIndices: destination has {outIndices.Length} " +
+                           $"slots but the buffer holds {count}.");
+            return;
+        }
+
+        if (indexScratch == null || indexScratch.Length < count) indexScratch = new uint[count];
+
+        sortedIndices.GetData(indexScratch, 0, 0, count);
+        NativeArray<uint>.Copy(indexScratch, outIndices, count);
+    }
+
+    /// <summary>
+    /// Reads back cell keys and coordinates for every packed particle, fluid and
+    /// boundary. Test and diagnostic use only.
+    /// </summary>
+    public void ReadbackCellKeysFull(NativeArray<uint> outKeys, NativeArray<int2> outCoords)
+    {
+        if (!ready || cellKeys == null) return;
+
+        int count = gridTotalCount;
+
+        if (outKeys.Length < count || outCoords.Length < count)
+        {
+            Debug.LogError($"SPHCompute.ReadbackCellKeysFull: destinations hold " +
+                           $"{outKeys.Length}/{outCoords.Length} slots but the buffer holds {count}.");
+            return;
+        }
+
+        if (keyScratch == null || keyScratch.Length < count) keyScratch = new uint[count];
+        if (coordScratch == null || coordScratch.Length < count) coordScratch = new int2[count];
+
+        cellKeys.GetData(keyScratch, 0, 0, count);
+        cellCoords.GetData(coordScratch, 0, 0, count);
+
+        NativeArray<uint>.Copy(keyScratch, outKeys, count);
+        NativeArray<int2>.Copy(coordScratch, outCoords, count);
+    }
+
     // Self test (T-026)
     // ------------------------------------------------------------------
 
@@ -864,6 +1079,9 @@ public class SPHCompute : MonoBehaviour
         extremes?.Release();
         cellKeys?.Release();
         cellCoords?.Release();
+        sortedIndices?.Release();
+        bucketStart?.Release();
+        bucketCursor?.Release();
 
         boundary = null;
         density = null;
@@ -875,6 +1093,11 @@ public class SPHCompute : MonoBehaviour
         extremes = null;
         cellKeys = null;
         cellCoords = null;
+        sortedIndices = null;
+        bucketStart = null;
+        bucketCursor = null;
+        gridTotalCount = 0;
+        gridBucketCount = 0;
 
         boundaryCapacity = 0;
         BoundaryCount = 0;
@@ -889,6 +1112,10 @@ public class SPHCompute : MonoBehaviour
         clearExtremesKernel = -1;
         reduceExtremesKernel = -1;
         cellKeysKernel = -1;
+        clearBucketsKernel = -1;
+        countBucketsKernel = -1;
+        prefixSumKernel = -1;
+        scatterKernel = -1;
 
         readbackScratch = null;
         scalarScratch = null;
@@ -896,6 +1123,8 @@ public class SPHCompute : MonoBehaviour
         extremesScratch = null;
         keyScratch = null;
         coordScratch = null;
+        bucketScratch = null;
+        indexScratch = null;
 
         extremesPending = false;
         hasParameters = false;

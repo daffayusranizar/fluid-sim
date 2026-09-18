@@ -1,21 +1,21 @@
 // GPU-side SPH pipeline.
 //
-// T-026 built the plumbing: the particle struct, the buffers, and a round-trip
-// probe. T-027 added density and pressure as two kernels mirroring the CPU's two
-// jobs. T-028 completes the physics: pressure force, XSPH viscosity, and
-// integration. T-029 removes the per-frame readback.
+// T-026 built the plumbing, T-027/T-028 the physics, T-029 the GPU-resident
+// loop, T-030 the cell keys. T-031 turns those keys into a queryable structure
+// (count sort + prefix scan) and rewires the three O(N^2) kernels to walk their
+// 3x3 cell neighbourhood instead.
 //
-// The struct must match Particle2D field for field. HLSL packs each float2 at
-// its natural 8-byte alignment, which lands every field at the same offset the
-// C# struct has, giving 40 bytes on both sides. That is also the stride
-// ParticleRenderer2D already uploads, so the buffer written here is the buffer
-// the renderer will read at T-032 with no repacking.
+// Particle indexing is PACKED, exactly as the CPU grid does it:
 //
-// The kernels are O(N^2): every thread loops every particle. That is deliberate
-// at this stage. A uniform grid on the GPU needs a count sort and prefix scan,
-// which is T-030/T-031, and doing it here would mean debugging hashing and
-// kernel math at the same time. Brute force produces the same numbers because
-// the kernel itself returns zero beyond h; the grid only avoids evaluating it.
+//   [0, _ParticleCount)              fluid particles, in _ParticlesIn
+//   [_ParticleCount, _TotalCount)    boundary particles, in _BoundaryPositions
+//
+// Boundary particles share the structure rather than getting their own. Leaving
+// them out would keep the force kernel's wall loop at O(N*B), and since
+// B ~ perimeter/spacing ~ sqrt(N) that term is O(N^1.5) -- only ~3% of the old
+// O(N^2) cost at N=10k, but the dominant term once the fluid query is fixed.
+// They are static, so their cell membership never changes in principle; at these
+// sizes re-sorting them each step is cheaper than the bookkeeping to avoid it.
 
 #pragma kernel ProbeRoundTrip
 #pragma kernel ComputeDensity
@@ -26,6 +26,12 @@
 #pragma kernel ClearExtremes
 #pragma kernel ReduceExtremes
 #pragma kernel ComputeCellKeys
+#pragma kernel ClearBuckets
+#pragma kernel CountBuckets
+#pragma kernel PrefixSumBuckets
+#pragma kernel ScatterParticles
+
+#define SCAN_THREADS 256
 
 struct Particle
 {
@@ -42,67 +48,59 @@ StructuredBuffer<Particle> _ParticlesIn;
 RWStructuredBuffer<Particle> _ParticlesOut;
 
 // Boundary particles are static: uploaded once, never written, never integrated.
-// They get their own buffer and a single scalar (_BoundaryVolume) rather than a
-// role in the simulation state, because that is genuinely all the solver needs
-// to use them. Decision recorded in docs/TASKS.md, GPU Port Decisions #2.
 StructuredBuffer<float2> _BoundaryPositions;
 
-// Density and pressure live in their own scalar buffers rather than in the
-// Particle struct's own fields. The density pass reads every particle and writes
-// only its own, so writing density back into Particle would have thread i writing
-// a field that thread j reads while computing its density. The value read is not
-// one this pass uses, so the race would be benign -- which is exactly the kind of
-// "benign" the CPU side removed in T-024 by moving to separate arrays. Same
-// reasoning, same answer. Force gets the same treatment for the same reason: the
-// force pass reads every particle's position and writes only its own force.
+// Density, pressure and force live outside the Particle struct so no pass writes
+// a field another thread reads. See the note in T-027/T-028.
 RWStructuredBuffer<float> _Density;
 RWStructuredBuffer<float> _NearDensity;
 RWStructuredBuffer<float> _Pressure;
 RWStructuredBuffer<float> _NearPressure;
 RWStructuredBuffer<float2> _Force;
-
-// The XSPH part of the force, kept separate for the debug arrows and so the
-// viscosity contribution can be diffed on its own against the CPU.
 RWStructuredBuffer<float2> _ViscosityForce;
 
-// Two uint slots: [0] max speed, [1] max acceleration magnitude. Written by
-// ReduceExtremes and read back asynchronously -- this is the one value the CPU
-// still needs to size an adaptive time step, and it is the reason T-029 does not
-// become a fixed-step solver by accident.
+// The one value the CPU still needs: max||v|| and max||a||, for the CFL step.
 RWStructuredBuffer<uint> _Extremes;
 
-// ----------------------------------------------------------------------
-// Spatial partitioning keys (T-030)
-// ----------------------------------------------------------------------
+// --- Spatial structure (T-030/T-031) ---
 
-// One key per particle. This is the whole of T-030: map a position to a cell,
-// then map that cell to a bucket. The count sort that consumes these keys is
-// T-031.
+// One entry per PACKED particle.
 RWStructuredBuffer<uint> _CellKeys;
 RWStructuredBuffer<int2> _CellCoords;
 
-// 0 = direct cell index, 1 = prime-multiplier hash. See KeyForCell for why this
-// build defaults to the direct index even though the hash is the portable form.
-uint _KeyMode;
+// Sorted particle indices, grouped by bucket. Bucket b owns
+// _SortedIndices[_BucketStart[b] .. _BucketStart[b+1]].
+RWStructuredBuffer<uint> _BucketStart;   // _BucketCount + 1 entries
+RWStructuredBuffer<uint> _SortedIndices;
 
+// Copy of _BucketStart consumed by the scatter. A separate buffer because
+// _BucketStart must stay intact for the neighbour queries.
+RWStructuredBuffer<uint> _BucketCursor;
+
+uint _ParticleCount;     // fluid only
+uint _BoundaryCount;
+uint _TotalCount;        // fluid + effective boundary
+uint _BucketCount;
+
+// 0 = direct cell index, 1 = prime-multiplier hash. See KeyForCell.
+uint _KeyMode;
 uint _GridCols;
 uint _GridRows;
 uint _HashTableSize;
 
+// Cell size is exactly h, and the origin is the container plus h of margin, so
+// cell coordinates are always inside [0, cols) x [0, rows) for this box.
 float _CellSize;
 float2 _GridOrigin;
-
-uint _ParticleCount;
-uint _BoundaryCount;
 
 // --- Solver parameters, mirroring SolverParams on the CPU ---
 float _SmoothingLength;
 float _SmoothingLengthSq;
-float _SpikyPow2Const;      // main channel density
-float _SpikyPow3Const;      // near channel density
-float _SpikyPow2GradConst;  // main channel force
-float _SpikyPow3GradConst;  // near channel force
-float _Poly6Const;          // viscosity weight
+float _SpikyPow2Const;
+float _SpikyPow3Const;
+float _SpikyPow2GradConst;
+float _SpikyPow3GradConst;
+float _Poly6Const;
 float _RestDensity;
 float _ParticleMass;
 float _BoundaryVolume;
@@ -121,8 +119,7 @@ float _DeltaTime;
 float2 _ProbeOffset;
 
 // ----------------------------------------------------------------------
-// Kernels and equation of state. Direct transcriptions of SPHMath.cs, so a
-// divergence is a transcription bug rather than a design difference.
+// Kernels and equation of state. Direct transcriptions of SPHMath.cs.
 // ----------------------------------------------------------------------
 
 float SpikyPow2Kernel(float r, float h, float k)
@@ -142,10 +139,9 @@ float SpikyPow3Kernel(float r, float h, float k)
 // NOTE: unlike the value kernels above, the gradient functions have no r >= h
 // early-out -- matching SPHMath.cs, where SpikyPow2GradientMagnitude returns a
 // negative (h - r) beyond h. On the CPU that never matters, because the caller
-// reaches these through the neighbour grid, so r < h is already guaranteed by
-// construction. Here the loop is brute force, so the r < h test has to be made
-// explicitly at each call site. Miss it and the force is silently wrong in a way
-// that still looks like a fluid.
+// reaches these through the neighbour grid. Here the caller also arrives through
+// the grid, but the grid only guarantees r < 3h, so each call site still keeps an
+// explicit r < h test.
 float SpikyPow2GradientMagnitude(float r, float h, float k)
 {
     return k * (h - r);
@@ -157,10 +153,8 @@ float SpikyPow3GradientMagnitude(float r, float h, float k)
     return k * hr * hr;
 }
 
-/// XSPH viscosity weight. Non-negative everywhere, which is the property that
-/// matters: a weighted average toward neighbours' velocities cannot add energy
-/// no matter how tightly particles are packed. Muller's Laplacian formulation
-/// needs a dedicated kernel precisely because a Laplacian can change sign.
+/// XSPH viscosity weight. Non-negative everywhere, so a weighted average toward
+/// neighbours' velocities cannot add energy.
 float Poly6Kernel(float r2, float h2, float k)
 {
     if (r2 >= h2) return 0.0;
@@ -169,8 +163,7 @@ float Poly6Kernel(float r2, float h2, float k)
 }
 
 /// Tait equation of state, linear form. The clamp is a flag, not a constant:
-/// with the near channel active it must stay off, because the near pressure is a
-/// permanent outward push that only a negative main pressure can balance.
+/// with the near channel active it must stay off.
 float TaitPressure(float density, bool clampPositive)
 {
     float p = _Stiffness * (density - _RestDensity);
@@ -178,11 +171,142 @@ float TaitPressure(float density, bool clampPositive)
     return p;
 }
 
-/// No rest-density offset by design: zero only when there are no close
-/// neighbours at all, and therefore never attractive.
 float NearPressure(float nearDensity)
 {
     return _NearPressureMultiplier * nearDensity;
+}
+
+// ----------------------------------------------------------------------
+// Spatial keys (T-030)
+// ----------------------------------------------------------------------
+
+int2 CellCoordOf(float2 position)
+{
+    return (int2)floor((position - _GridOrigin) / _CellSize);
+}
+
+/// Maps a cell to a bucket. Direct mode is collision-free and only valid for a
+/// bounded domain; hash mode is the portable form for an unbounded one.
+uint KeyForCell(int2 cell)
+{
+    if (_KeyMode == 1u)
+    {
+        uint x = (uint)cell.x * 73856093u;
+        uint y = (uint)cell.y * 19349663u;
+        return (x ^ y) % _HashTableSize;
+    }
+
+    int cx = clamp(cell.x, 0, (int)_GridCols - 1);
+    int cy = clamp(cell.y, 0, (int)_GridRows - 1);
+    return (uint)(cy * (int)_GridCols + cx);
+}
+
+float2 PositionOfPacked(uint p)
+{
+    if (p < _ParticleCount) return _ParticlesIn[p].position;
+    return _BoundaryPositions[p - _ParticleCount];
+}
+
+[numthreads(64, 1, 1)]
+void ComputeCellKeys(uint3 id : SV_DispatchThreadID)
+{
+    uint p = id.x;
+    if (p >= _TotalCount) return;
+
+    int2 cell = CellCoordOf(PositionOfPacked(p));
+
+    _CellCoords[p] = cell;
+    _CellKeys[p] = KeyForCell(cell);
+}
+
+// ----------------------------------------------------------------------
+// Count sort + prefix scan (T-031)
+// ----------------------------------------------------------------------
+
+[numthreads(64, 1, 1)]
+void ClearBuckets(uint3 id : SV_DispatchThreadID)
+{
+    uint b = id.x;
+    if (b < _BucketCount) _BucketStart[b] = 0u;
+}
+
+/// Pass 1 of the sort: histogram. Atomics are unavoidable here because an
+/// arbitrary number of particles share a bucket and the scatter order does not
+/// matter.
+[numthreads(64, 1, 1)]
+void CountBuckets(uint3 id : SV_DispatchThreadID)
+{
+    uint p = id.x;
+    if (p >= _TotalCount) return;
+
+    InterlockedAdd(_BucketStart[_CellKeys[p]], 1u);
+}
+
+groupshared uint _scanTile[SCAN_THREADS];
+
+/// Pass 2: exclusive prefix sum over bucket counts, turning them into run
+/// offsets. In place: on entry _BucketStart holds counts, on exit it holds the
+/// first slot of each bucket's run and _BucketStart[_BucketCount] holds the
+/// total.
+///
+/// One workgroup walks the array in tiles, carrying the running total between
+/// them, and scans each tile with a Hillis-Steele inclusive scan. A single
+/// workgroup is enough because _BucketCount is ~N/4.8 (~2.3k at N=10k); a
+/// multi-workgroup scan would only pay off at an order of magnitude more
+/// buckets. Tiles are processed in order, so no inter-workgroup coordination is
+/// needed.
+[numthreads(SCAN_THREADS, 1, 1)]
+void PrefixSumBuckets(uint3 id : SV_DispatchThreadID)
+{
+    uint t = id.x;
+    uint carry = 0u;
+
+    for (uint base = 0u; base < _BucketCount; base += SCAN_THREADS)
+    {
+        uint i = base + t;
+        uint v = (i < _BucketCount) ? _BucketStart[i] : 0u;
+
+        _scanTile[t] = v;
+        GroupMemoryBarrierWithGroupSync();
+
+        for (uint offset = 1u; offset < SCAN_THREADS; offset <<= 1)
+        {
+            uint other = (t >= offset) ? _scanTile[t - offset] : 0u;
+
+            GroupMemoryBarrierWithGroupSync();
+            _scanTile[t] += other;
+            GroupMemoryBarrierWithGroupSync();
+        }
+
+        uint exclusive = carry + _scanTile[t] - v;
+
+        if (i < _BucketCount)
+        {
+            _BucketStart[i] = exclusive;
+            _BucketCursor[i] = exclusive;
+        }
+
+        carry += _scanTile[SCAN_THREADS - 1];
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (t == 0u) _BucketStart[_BucketCount] = carry;
+}
+
+/// Pass 3: scatter. Each particle takes the next slot in its bucket via the
+/// cursor. Within a bucket the order is therefore arbitrary, which changes the
+/// summation order in the density and force kernels but not their meaning.
+[numthreads(64, 1, 1)]
+void ScatterParticles(uint3 id : SV_DispatchThreadID)
+{
+    uint p = id.x;
+    if (p >= _TotalCount) return;
+
+    // The two-argument InterlockedAdd returns void; the returning form is the
+    // three-argument overload with an out parameter.
+    uint slot;
+    InterlockedAdd(_BucketCursor[_CellKeys[p]], 1u, slot);
+    _SortedIndices[slot] = p;
 }
 
 // ----------------------------------------------------------------------
@@ -193,21 +317,10 @@ float NearPressure(float nearDensity)
 void ProbeRoundTrip(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-
-    // Dispatch always rounds up to a whole number of thread groups, so the final
-    // group can contain threads past the end of the array. They must return
-    // before touching a buffer or they read and write out of bounds.
     if (i >= _ParticleCount) return;
 
     Particle p = _ParticlesIn[i];
-
-    // Deterministic transform, so the CPU can prove the GPU actually ran. The
-    // offset is supplied from C# rather than hardcoded here so both sides agree
-    // on one value.
     p.position += _ProbeOffset;
-
-    // Reads the boundary inputs so a missing or unbound binding fails here,
-    // loudly, instead of at T-028 where it would present as a density bug.
     p.force = _BoundaryPositions[0];
     p.density = _BoundaryVolume;
 
@@ -215,7 +328,7 @@ void ProbeRoundTrip(uint3 id : SV_DispatchThreadID)
 }
 
 // ----------------------------------------------------------------------
-// Density (T-027)
+// Density (T-027, gridded in T-031)
 // ----------------------------------------------------------------------
 
 [numthreads(64, 1, 1)]
@@ -225,31 +338,49 @@ void ComputeDensity(uint3 id : SV_DispatchThreadID)
     if (i >= _ParticleCount) return;
 
     float2 posI = _ParticlesIn[i].position;
+    int2 cell = CellCoordOf(posI);
+
     float mainDensity = 0.0;
     float near = 0.0;
 
-    for (uint j = 0; j < _ParticleCount; j++)
+    for (int dy = -1; dy <= 1; dy++)
     {
-        if (j == i) continue;
+        int cy = cell.y + dy;
+        if (cy < 0 || cy >= (int)_GridRows) continue;
 
-        float r = distance(_ParticlesIn[j].position, posI);
-
-        mainDensity += _ParticleMass * SpikyPow2Kernel(r, _SmoothingLength, _SpikyPow2Const);
-        near += _ParticleMass * SpikyPow3Kernel(r, _SmoothingLength, _SpikyPow3Const);
-    }
-
-    // The wall contributes to the main channel only. Without this, roughly half
-    // of a particle's kernel support near a wall is missing, density collapses,
-    // pressure follows it, and particles weld themselves to the wall -- the
-    // T-020 bug, reintroduced on the GPU.
-    if (_UseBoundaryParticles != 0)
-    {
-        for (uint b = 0; b < _BoundaryCount; b++)
+        for (int dx = -1; dx <= 1; dx++)
         {
-            float r = distance(_BoundaryPositions[b], posI);
+            int cx = cell.x + dx;
 
-            mainDensity += _RestDensity * _BoundaryVolume
-                           * SpikyPow2Kernel(r, _SmoothingLength, _SpikyPow2Const);
+            // Out-of-grid cells are SKIPPED, never clamped. Clamping would make
+            // KeyForCell return the edge cell for several deltas, so an edge
+            // particle would scan the same bucket up to four times and
+            // double-count its occupants. The CPU grid skips for the same reason.
+            if (cx < 0 || cx >= (int)_GridCols) continue;
+
+            uint key = KeyForCell(int2(cx, cy));
+            uint start = _BucketStart[key];
+            uint end = _BucketStart[key + 1];
+
+            for (uint s = start; s < end; s++)
+            {
+                uint q = _SortedIndices[s];
+
+                if (q < _ParticleCount)
+                {
+                    if (q == i) continue;
+
+                    float r = distance(_ParticlesIn[q].position, posI);
+                    mainDensity += _ParticleMass * SpikyPow2Kernel(r, _SmoothingLength, _SpikyPow2Const);
+                    near += _ParticleMass * SpikyPow3Kernel(r, _SmoothingLength, _SpikyPow3Const);
+                }
+                else if (_UseBoundaryParticles != 0u)
+                {
+                    float r = distance(_BoundaryPositions[q - _ParticleCount], posI);
+                    mainDensity += _RestDensity * _BoundaryVolume
+                                   * SpikyPow2Kernel(r, _SmoothingLength, _SpikyPow2Const);
+                }
+            }
         }
     }
 
@@ -272,12 +403,9 @@ void ComputePressure(uint3 id : SV_DispatchThreadID)
 }
 
 // ----------------------------------------------------------------------
-// Pressure force (T-028)
+// Pressure force (T-028, gridded in T-031)
 // ----------------------------------------------------------------------
 
-/// Forces are assigned, not accumulated, so no reset pass is needed. The CPU
-/// still has ResetForcesJob because the force stage used to accumulate; with
-/// `force[i] = accumulated` it is now redundant there too.
 [numthreads(64, 1, 1)]
 void ComputePressureForce(uint3 id : SV_DispatchThreadID)
 {
@@ -287,66 +415,72 @@ void ComputePressureForce(uint3 id : SV_DispatchThreadID)
     float h = _SmoothingLength;
     float h2 = h * h;
     float2 posI = _ParticlesIn[i].position;
+    int2 cell = CellCoordOf(posI);
     float2 accumulated = 0.0;
 
-    for (uint j = 0; j < _ParticleCount; j++)
+    // The wall may push but never pull, and the clamp here is independent of
+    // _ClampPressurePositive: mirroring copies this particle's own pressure,
+    // which is often negative at a wall.
+    float boundaryPressure = max(0.0, _Pressure[i]);
+
+    for (int dy = -1; dy <= 1; dy++)
     {
-        if (j == i) continue;
+        int cy = cell.y + dy;
+        if (cy < 0 || cy >= (int)_GridRows) continue;
 
-        float2 rVec = posI - _ParticlesIn[j].position;
-        float r2 = dot(rVec, rVec);
-
-        // The explicit r < h test that the neighbour grid normally provides.
-        if (r2 >= h2 || r2 <= 0.0) continue;
-
-        float r = sqrt(r2);
-        float2 dir = rVec / r;
-
-        // Main channel: symmetrised Tait pressure over the linear SpikyPow2
-        // gradient. This one can be attractive.
-        float otherDensity = _Density[j];
-        if (otherDensity > 0.0001)
+        for (int dx = -1; dx <= 1; dx++)
         {
-            float sharedPressure = (_Pressure[i] + _Pressure[j]) * 0.5;
+            int cx = cell.x + dx;
+            if (cx < 0 || cx >= (int)_GridCols) continue;
 
-            accumulated += dir * (_ParticleMass
-                                  * SpikyPow2GradientMagnitude(r, h, _SpikyPow2GradConst)
-                                  * sharedPressure / otherDensity);
-        }
+            uint key = KeyForCell(int2(cx, cy));
+            uint start = _BucketStart[key];
+            uint end = _BucketStart[key + 1];
 
-        // Near channel: always repulsive, short range only. This is what keeps
-        // the fluid from collapsing when the main term goes negative.
-        float otherNearDensity = _NearDensity[j];
-        if (otherNearDensity > 0.0001)
-        {
-            float sharedNearPressure = (_NearPressure[i] + _NearPressure[j]) * 0.5;
+            for (uint s = start; s < end; s++)
+            {
+                uint q = _SortedIndices[s];
 
-            accumulated += dir * (_ParticleMass
-                                  * SpikyPow3GradientMagnitude(r, h, _SpikyPow3GradConst)
-                                  * sharedNearPressure / otherNearDensity);
-        }
-    }
+                if (q == i) continue;
 
-    // The wall may push but never pull. Mirroring copies this particle's own
-    // pressure, and that value is often negative near a wall where density is
-    // below rest. A mirrored negative pressure would make the boundary
-    // attractive, so it is clamped -- unconditionally, and independently of
-    // _ClampPressurePositive, exactly as the CPU does.
-    if (_UseBoundaryParticles != 0)
-    {
-        float boundaryPressure = max(0.0, _Pressure[i]);
+                float2 rVec = posI - PositionOfPacked(q);
+                float r2 = dot(rVec, rVec);
 
-        for (uint b = 0; b < _BoundaryCount; b++)
-        {
-            float2 rVec = posI - _BoundaryPositions[b];
-            float r2 = dot(rVec, rVec);
-            if (r2 >= h2 || r2 <= 0.0) continue;
+                // The 3x3 scan only guarantees r < 3h, and the gradient functions
+                // are unguarded past h, so this test is required at every call site.
+                if (r2 >= h2 || r2 <= 0.0) continue;
 
-            float r = sqrt(r2);
-            float2 dir = rVec / r;
+                float r = sqrt(r2);
+                float2 dir = rVec / r;
 
-            accumulated += dir * (_BoundaryVolume * boundaryPressure
-                                  * SpikyPow2GradientMagnitude(r, h, _SpikyPow2GradConst));
+                if (q < _ParticleCount)
+                {
+                    float otherDensity = _Density[q];
+                    if (otherDensity > 0.0001)
+                    {
+                        float sharedPressure = (_Pressure[i] + _Pressure[q]) * 0.5;
+
+                        accumulated += dir * (_ParticleMass
+                                              * SpikyPow2GradientMagnitude(r, h, _SpikyPow2GradConst)
+                                              * sharedPressure / otherDensity);
+                    }
+
+                    float otherNearDensity = _NearDensity[q];
+                    if (otherNearDensity > 0.0001)
+                    {
+                        float sharedNearPressure = (_NearPressure[i] + _NearPressure[q]) * 0.5;
+
+                        accumulated += dir * (_ParticleMass
+                                              * SpikyPow3GradientMagnitude(r, h, _SpikyPow3GradConst)
+                                              * sharedNearPressure / otherNearDensity);
+                    }
+                }
+                else if (_UseBoundaryParticles != 0u)
+                {
+                    accumulated += dir * (_BoundaryVolume * boundaryPressure
+                                          * SpikyPow2GradientMagnitude(r, h, _SpikyPow2GradConst));
+                }
+            }
         }
     }
 
@@ -354,13 +488,9 @@ void ComputePressureForce(uint3 id : SV_DispatchThreadID)
 }
 
 // ----------------------------------------------------------------------
-// Viscosity (T-028)
+// Viscosity (T-028, gridded in T-031)
 // ----------------------------------------------------------------------
 
-/// Reads _Force and adds to it, so this must be dispatched after
-/// ComputePressureForce. Dispatches on one queue are ordered on the GPU with a
-/// UAV barrier between them, which plays the role the job dependency played on
-/// the CPU.
 [numthreads(64, 1, 1)]
 void ComputeViscosity(uint3 id : SV_DispatchThreadID)
 {
@@ -369,22 +499,39 @@ void ComputeViscosity(uint3 id : SV_DispatchThreadID)
 
     float2 posI = _ParticlesIn[i].position;
     float2 velI = _ParticlesIn[i].velocity;
+    int2 cell = CellCoordOf(posI);
     float2 viscForce = 0.0;
 
-    for (uint j = 0; j < _ParticleCount; j++)
+    for (int dy = -1; dy <= 1; dy++)
     {
-        if (j == i) continue;
+        int cy = cell.y + dy;
+        if (cy < 0 || cy >= (int)_GridRows) continue;
 
-        float2 rVec = _ParticlesIn[j].position - posI;
-        float r2 = dot(rVec, rVec);
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            int cx = cell.x + dx;
+            if (cx < 0 || cx >= (int)_GridCols) continue;
 
-        // XSPH: Poly6 is a weight on the velocity difference, not a Laplacian.
-        // Being non-negative everywhere it can only pull this velocity toward
-        // its neighbours', so there is no sign to get wrong and no way for the
-        // term to add energy. It also needs no square root. The kernel's own
-        // r2 >= h2 early-out is the neighbour restriction here.
-        viscForce += (_ParticlesIn[j].velocity - velI)
-                     * Poly6Kernel(r2, _SmoothingLengthSq, _Poly6Const);
+            uint key = KeyForCell(int2(cx, cy));
+            uint start = _BucketStart[key];
+            uint end = _BucketStart[key + 1];
+
+            for (uint s = start; s < end; s++)
+            {
+                uint q = _SortedIndices[s];
+
+                // Fluid only. Boundary particles are static, so their velocity is
+                // zero and including them would just damp the fluid against walls.
+                if (q >= _ParticleCount) continue;
+                if (q == i) continue;
+
+                float2 rVec = _ParticlesIn[q].position - posI;
+                float r2 = dot(rVec, rVec);
+
+                viscForce += (_ParticlesIn[q].velocity - velI)
+                             * Poly6Kernel(r2, _SmoothingLengthSq, _Poly6Const);
+            }
+        }
     }
 
     _ViscosityForce[i] = viscForce;
@@ -395,9 +542,6 @@ void ComputeViscosity(uint3 id : SV_DispatchThreadID)
 // Integration (T-028)
 // ----------------------------------------------------------------------
 
-/// Semi-implicit Euler, then the wall clamp. The clamp is only a penetration
-/// safety net -- wall physics is the boundary particles' job -- but it
-/// guarantees nothing escapes if a step overshoots.
 [numthreads(64, 1, 1)]
 void Integrate(uint3 id : SV_DispatchThreadID)
 {
@@ -406,10 +550,6 @@ void Integrate(uint3 id : SV_DispatchThreadID)
 
     float particleDensity = _Density[i];
 
-    // Isolation guard, matching the CPU: a particle with no density has no
-    // acceleration to integrate, so it passes through unchanged rather than
-    // being divided by (almost) zero. Writing the input through is the same as
-    // the CPU's early return, because the CPU integrates in place.
     if (particleDensity <= 0.0001)
     {
         _ParticlesOut[i] = _ParticlesIn[i];
@@ -464,16 +604,9 @@ void ClearExtremes(uint3 id : SV_DispatchThreadID)
     _Extremes[1] = 0;
 }
 
-/// Reduces max speed and max acceleration across all particles.
-///
-/// This is the whole of the CPU's remaining involvement in the step: the CFL
-/// limit needs max||v|| and max||a||, and nothing else about the simulation state
-/// ever leaves the GPU.
-///
-/// Atomics are integer-only in HLSL, so a float max is done by reinterpreting.
-/// That is valid here because both values are magnitudes: a non-negative IEEE
-/// float's bit pattern is monotonically ordered when compared as an unsigned
-/// int. It would not work for a signed quantity.
+/// Integer InterlockedMax on the float bit patterns. Valid only because both
+/// quantities are magnitudes, where the IEEE bit pattern is monotonic as an
+/// unsigned int. It would not work for a signed quantity.
 [numthreads(64, 1, 1)]
 void ReduceExtremes(uint3 id : SV_DispatchThreadID)
 {
@@ -489,62 +622,4 @@ void ReduceExtremes(uint3 id : SV_DispatchThreadID)
         float2 a = _Force[i] / d + _Gravity;
         InterlockedMax(_Extremes[1], asuint(length(a)));
     }
-}
-
-// ----------------------------------------------------------------------
-// Spatial keys (T-030)
-// ----------------------------------------------------------------------
-
-/// Cell coordinate of a position. The grid origin is included in the domain, so
-/// for this bounded box the result is always inside [0, cols) x [0, rows).
-int2 CellCoordOf(float2 position)
-{
-    return (int2)floor((position - _GridOrigin) / _CellSize);
-}
-
-/// Maps a cell to a bucket.
-///
-/// Two modes, because the right answer depends on whether the domain is bounded:
-///
-/// - Direct index (mode 0): unique per cell, so collisions are impossible. Only
-///   valid for a bounded domain where the cell is known to be inside the grid,
-///   which is exactly this box.
-///
-/// - Prime-multiplier hash (mode 1): the portable form, for an unbounded domain
-///   where cell coordinates are arbitrary. XOR rather than add so the two axes do
-///   not carry into each other, and primes so that a regular lattice -- which is
-///   precisely what a spawn grid produces -- does not collapse into a few buckets.
-///
-/// It is tempting to assume the bigger hash table (2N vs ~N/4.5 buckets) buys
-/// fewer candidates per query. It does not. With cell size = h a cell holds
-/// ~h^2/spacing^2 ~ 4.8 particles either way, so a 3x3 query scans the same ~43
-/// candidates in both modes; the hash only adds false positives and memory.
-/// The hash earns its place when the domain is unbounded.
-uint KeyForCell(int2 cell)
-{
-    if (_KeyMode == 1u)
-    {
-        uint x = (uint)cell.x * 73856093u;
-        uint y = (uint)cell.y * 19349663u;
-        return (x ^ y) % _HashTableSize;
-    }
-
-    int cx = clamp(cell.x, 0, (int)_GridCols - 1);
-    int cy = clamp(cell.y, 0, (int)_GridRows - 1);
-    return (uint)(cy * (int)_GridCols + cx);
-}
-
-/// One key and one cell coordinate per particle. The coordinate is kept as well
-/// as the key because a hashed bucket cannot be inverted: a neighbour query has
-/// to reject candidates whose cell is not actually adjacent.
-[numthreads(64, 1, 1)]
-void ComputeCellKeys(uint3 id : SV_DispatchThreadID)
-{
-    uint i = id.x;
-    if (i >= _ParticleCount) return;
-
-    int2 cell = CellCoordOf(_ParticlesIn[i].position);
-
-    _CellCoords[i] = cell;
-    _CellKeys[i] = KeyForCell(cell);
 }
