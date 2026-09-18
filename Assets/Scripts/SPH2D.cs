@@ -38,6 +38,10 @@ public class SPH2D : MonoBehaviour
     public float minTimeStep = 0.0002f;
     public float maxTimeStep = 0.02f;
 
+    [Tooltip("Run the Burst job solver in Update(). Turn this off when a GPU " +
+             "simulation is driving the same state, so the two do not diverge.")]
+    public bool solveOnCpu = true;
+
     [Tooltip("Particles per job batch. Lower gives a more even spread across " +
              "cores but adds scheduling overhead; raise it until gains flatten out.")]
     public int batchCount = 64;
@@ -126,6 +130,16 @@ public class SPH2D : MonoBehaviour
     /// </summary>
     public NativeArray<Particle2D> Particles => renderBuffer;
 
+    /// <summary>The static wall particles, as the solver sees them.</summary>
+    public NativeArray<float2> BoundaryParticles => BoundaryView();
+
+    /// <summary>
+    /// The parameter block the Burst passes and the GPU kernels both read. Built
+    /// in Awake and on every CPU step; when <see cref="solveOnCpu"/> is false it
+    /// only reflects the values as of Awake.
+    /// </summary>
+    public SolverParams Parameters => solverParams;
+
     private void Awake()
     {
         state = new ParticleState(particleCount, Allocator.Persistent);
@@ -149,6 +163,11 @@ public class SPH2D : MonoBehaviour
 
         SpawnBoundaryParticles();
         BuildSolverParams();
+
+        // Pack the render view once here, so Particles is already valid for
+        // anything that reads it in Start() -- notably a GPU simulation seeding
+        // itself. Without this the buffer stays zero until the first Update.
+        RunRepack();
     }
 
     private void OnDestroy()
@@ -461,6 +480,10 @@ public class SPH2D : MonoBehaviour
     private void Update()
     {
         if (!state.IsCreated) return;
+
+        // A GPU simulation owns the state when it is driving; running the Burst
+        // solver as well would advance the same particles twice.
+        if (!solveOnCpu) return;
 
         BuildSolverParams();
 

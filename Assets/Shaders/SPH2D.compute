@@ -23,6 +23,8 @@
 #pragma kernel ComputePressureForce
 #pragma kernel ComputeViscosity
 #pragma kernel Integrate
+#pragma kernel ClearExtremes
+#pragma kernel ReduceExtremes
 
 struct Particle
 {
@@ -61,6 +63,12 @@ RWStructuredBuffer<float2> _Force;
 // The XSPH part of the force, kept separate for the debug arrows and so the
 // viscosity contribution can be diffed on its own against the CPU.
 RWStructuredBuffer<float2> _ViscosityForce;
+
+// Two uint slots: [0] max speed, [1] max acceleration magnitude. Written by
+// ReduceExtremes and read back asynchronously -- this is the one value the CPU
+// still needs to size an adaptive time step, and it is the reason T-029 does not
+// become a fixed-step solver by accident.
+RWStructuredBuffer<uint> _Extremes;
 
 uint _ParticleCount;
 uint _BoundaryCount;
@@ -421,4 +429,42 @@ void Integrate(uint3 id : SV_DispatchThreadID)
     p.position = pos;
 
     _ParticlesOut[i] = p;
+}
+
+// ----------------------------------------------------------------------
+// Extremes reduction (T-029)
+// ----------------------------------------------------------------------
+
+[numthreads(1, 1, 1)]
+void ClearExtremes(uint3 id : SV_DispatchThreadID)
+{
+    _Extremes[0] = 0;
+    _Extremes[1] = 0;
+}
+
+/// Reduces max speed and max acceleration across all particles.
+///
+/// This is the whole of the CPU's remaining involvement in the step: the CFL
+/// limit needs max||v|| and max||a||, and nothing else about the simulation state
+/// ever leaves the GPU.
+///
+/// Atomics are integer-only in HLSL, so a float max is done by reinterpreting.
+/// That is valid here because both values are magnitudes: a non-negative IEEE
+/// float's bit pattern is monotonically ordered when compared as an unsigned
+/// int. It would not work for a signed quantity.
+[numthreads(64, 1, 1)]
+void ReduceExtremes(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount) return;
+
+    float speed = length(_ParticlesIn[i].velocity);
+    InterlockedMax(_Extremes[0], asuint(speed));
+
+    float d = _Density[i];
+    if (d > 0.0001)
+    {
+        float2 a = _Force[i] / d + _Gravity;
+        InterlockedMax(_Extremes[1], asuint(length(a)));
+    }
 }

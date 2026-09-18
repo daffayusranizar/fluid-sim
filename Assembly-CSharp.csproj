@@ -63,6 +63,7 @@
     <Compile Include="Assets/Scripts/SPHSolver.cs" />
     <Compile Include="Assets/Scripts/SPH2D.cs" />
     <Compile Include="Assets/Scripts/SPHCompute.cs" />
+    <Compile Include="Assets/Scripts/SPHComputeSimulation.cs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="Assets/TutorialInfo/StyleSheets/ReadmeEditor.uss" />

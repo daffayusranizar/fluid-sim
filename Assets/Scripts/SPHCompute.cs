@@ -1,20 +1,24 @@
 using Unity.Collections;
 using Unity.Mathematics;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 /// <summary>
 /// Owner of the GPU-side particle buffers and dispatch.
 ///
-/// T-026 built the plumbing (allocate, upload, dispatch, read back). T-027 adds
-/// the first physics: a density kernel and a pressure kernel that mirror the
-/// CPU's two jobs one for one, so the two implementations can be compared on
-/// identical input. T-028 adds forces, T-029 removes the per-frame readback.
+/// T-026 built the plumbing, T-027 added density and pressure, T-028 added forces
+/// and integration. T-029 makes the pipeline able to run on its own: particle
+/// state stays resident on the GPU and is ping-ponged between two buffers, so a
+/// step never round-trips through the CPU.
+///
+/// The one exception is deliberate and small. An adaptive CFL step needs
+/// max||v|| and max||a||, which is a CPU-side number by definition. Those are
+/// reduced on the GPU into a two-uint buffer and read back asynchronously, one
+/// frame late. That keeps T-021's adaptive step alive without a pipeline stall,
+/// and it is GPU Port Decision #4 in docs/TASKS.md.
 ///
 /// The GPU layout mirrors <see cref="ParticleState"/> on purpose: one structured
-/// buffer holding the same 40-byte Particle2D the renderer already consumes. That
-/// is deliberate for two reasons. It means the solver's CPU memory layout is free
-/// to change without touching the shader, and it means the buffer the simulation
-/// writes is already the buffer the renderer will want at T-032.
+/// buffer holding the same 40-byte Particle2D the renderer already consumes.
 ///
 /// Boundary particles get their own buffer. They are uploaded once at spawn and
 /// never written again, so they need no double buffering and no place in the
@@ -34,6 +38,8 @@ public class SPHCompute : MonoBehaviour
     private const string ForceKernelName = "ComputePressureForce";
     private const string ViscosityKernelName = "ComputeViscosity";
     private const string IntegrateKernelName = "Integrate";
+    private const string ClearExtremesKernelName = "ClearExtremes";
+    private const string ReduceExtremesKernelName = "ReduceExtremes";
 
     /// <summary>
     /// Displacement the probe kernel applies to every position. Passed to the
@@ -41,27 +47,29 @@ public class SPHCompute : MonoBehaviour
     /// </summary>
     public static readonly float2 ProbeOffset = new float2(0.125f, -0.25f);
 
-    [Tooltip("Compute shader asset. Needs the ProbeRoundTrip, ComputeDensity and " +
-             "ComputePressure kernels.")]
+    [Tooltip("Compute shader asset. Needs every kernel in SPH2D.compute.")]
     public ComputeShader shader;
 
     [Tooltip("Particle capacity. Buffers are allocated to this by Initialize().")]
     public int particleCapacity = 400;
 
-    [Tooltip("Scalar the solver uses to weight boundary contributions. Placeholder " +
-             "value until T-028 feeds the real one (spawnSpacing squared).")]
+    [Tooltip("Scalar the solver uses to weight boundary contributions (spawnSpacing squared).")]
     public float boundaryVolume = 0.0625f;
 
-    [Tooltip("Run the round-trip self test once in Start(). Useful while the " +
-             "pipeline is being built; turn it off once physics is running.")]
+    [Tooltip("Run the round-trip self test once in Start(). Turn this off once " +
+             "SPHComputeSimulation is driving the pipeline.")]
     public bool verifyOnStart = true;
 
-    private ComputeBuffer particlesIn;
-    private ComputeBuffer particlesOut;
+    // Ping-pong state. Two buffers, because Integrate reads the current particle
+    // and writes the next one; with a single buffer every thread would be reading
+    // a slot another thread is overwriting.
+    private readonly ComputeBuffer[] particleBuffers = new ComputeBuffer[2];
+    private int current;
+
     private ComputeBuffer boundary;
 
-    // Density, pressure and force are kept out of the Particle struct so no pass
-    // writes a field another thread is reading. See the note in SPH2D.compute.
+    // Density, pressure and force live outside the Particle struct so no pass
+    // writes a field another thread reads. See the note in SPH2D.compute.
     private ComputeBuffer density;
     private ComputeBuffer nearDensity;
     private ComputeBuffer pressure;
@@ -69,12 +77,16 @@ public class SPHCompute : MonoBehaviour
     private ComputeBuffer force;
     private ComputeBuffer viscosityForce;
 
+    private ComputeBuffer extremes;
+
     private int probeKernel = -1;
     private int densityKernel = -1;
     private int pressureKernel = -1;
     private int forceKernel = -1;
     private int viscosityKernel = -1;
     private int integrateKernel = -1;
+    private int clearExtremesKernel = -1;
+    private int reduceExtremesKernel = -1;
 
     private int boundaryCapacity;
     private bool ready;
@@ -82,15 +94,32 @@ public class SPHCompute : MonoBehaviour
     private SolverParams parameters;
     private bool hasParameters;
 
+    private bool extremesPending;
+    private AsyncGPUReadbackRequest extremesRequest;
+
     // Reused between readbacks so the one unavoidable managed hop does not
-    // allocate every frame. T-029 removes the readback entirely.
+    // allocate every frame.
     private Particle2D[] readbackScratch;
     private float[] scalarScratch;
     private float2[] vectorScratch;
+    private uint[] extremesScratch;
 
     public bool IsReady => ready;
     public int ParticleCapacity => particleCapacity;
     public int BoundaryCount { get; private set; }
+
+    /// <summary>
+    /// max||v|| and max||a|| from the most recent completed asynchronous readback.
+    /// These are one frame old by construction, which is the price of not stalling
+    /// the pipeline; the CPU already sized dt from the previous step's state.
+    /// </summary>
+    public float LastMaxSpeed { get; private set; }
+    public float LastMaxAccel { get; private set; }
+
+    public bool HasPendingExtremesReadback => extremesPending;
+
+    private ComputeBuffer ParticlesIn => particleBuffers[current];
+    private ComputeBuffer ParticlesOut => particleBuffers[1 - current];
 
     private void Start()
     {
@@ -124,8 +153,11 @@ public class SPHCompute : MonoBehaviour
         }
 
         foreach (string name in new[]
-                 { ProbeKernelName, DensityKernelName, PressureKernelName,
-                   ForceKernelName, ViscosityKernelName, IntegrateKernelName })
+                 {
+                     ProbeKernelName, DensityKernelName, PressureKernelName,
+                     ForceKernelName, ViscosityKernelName, IntegrateKernelName,
+                     ClearExtremesKernelName, ReduceExtremesKernelName,
+                 })
         {
             if (!shader.HasKernel(name))
             {
@@ -137,15 +169,19 @@ public class SPHCompute : MonoBehaviour
         Release();
 
         particleCapacity = Mathf.Max(1, capacity);
+
         probeKernel = shader.FindKernel(ProbeKernelName);
         densityKernel = shader.FindKernel(DensityKernelName);
         pressureKernel = shader.FindKernel(PressureKernelName);
         forceKernel = shader.FindKernel(ForceKernelName);
         viscosityKernel = shader.FindKernel(ViscosityKernelName);
         integrateKernel = shader.FindKernel(IntegrateKernelName);
+        clearExtremesKernel = shader.FindKernel(ClearExtremesKernelName);
+        reduceExtremesKernel = shader.FindKernel(ReduceExtremesKernelName);
 
-        particlesIn = new ComputeBuffer(particleCapacity, ParticleStride, ComputeBufferType.Structured);
-        particlesOut = new ComputeBuffer(particleCapacity, ParticleStride, ComputeBufferType.Structured);
+        particleBuffers[0] = new ComputeBuffer(particleCapacity, ParticleStride, ComputeBufferType.Structured);
+        particleBuffers[1] = new ComputeBuffer(particleCapacity, ParticleStride, ComputeBufferType.Structured);
+        current = 0;
 
         density = new ComputeBuffer(particleCapacity, sizeof(float), ComputeBufferType.Structured);
         nearDensity = new ComputeBuffer(particleCapacity, sizeof(float), ComputeBufferType.Structured);
@@ -153,6 +189,8 @@ public class SPHCompute : MonoBehaviour
         nearPressure = new ComputeBuffer(particleCapacity, sizeof(float), ComputeBufferType.Structured);
         force = new ComputeBuffer(particleCapacity, sizeof(float) * 2, ComputeBufferType.Structured);
         viscosityForce = new ComputeBuffer(particleCapacity, sizeof(float) * 2, ComputeBufferType.Structured);
+
+        extremes = new ComputeBuffer(2, sizeof(uint), ComputeBufferType.Structured);
 
         // Park a one-element boundary buffer immediately. The kernel reads element
         // zero unconditionally, so it must never be null, and a zero-length
@@ -162,17 +200,20 @@ public class SPHCompute : MonoBehaviour
         boundaryCapacity = 1;
         BoundaryCount = 0;
 
+        LastMaxSpeed = 0f;
+        LastMaxAccel = 0f;
+
         ready = true;
         return true;
     }
 
-    /// <summary>Uploads the fluid particle state. Called once per frame at T-029.</summary>
+    /// <summary>Uploads the fluid particle state. Called once at seed time.</summary>
     public void UploadParticles(NativeArray<Particle2D> particles)
     {
         if (!ready || particles.Length == 0) return;
 
         int count = Mathf.Min(particles.Length, particleCapacity);
-        particlesIn.SetData(particles, 0, 0, count);
+        ParticlesIn.SetData(particles, 0, 0, count);
     }
 
     /// <summary>
@@ -209,9 +250,7 @@ public class SPHCompute : MonoBehaviour
     /// <remarks>
     /// Takes the CPU's own <see cref="SolverParams"/> rather than a parallel set
     /// of fields, so there is one definition of what h, the kernel constants and
-    /// the EOS coefficients mean. This is the struct T-026's comment predicted
-    /// would become the constant block almost verbatim; the only change is that
-    /// the two bools cross the boundary as 0/1.
+    /// the EOS coefficients mean.
     /// </remarks>
     public void UploadParameters(in SolverParams p)
     {
@@ -219,13 +258,56 @@ public class SPHCompute : MonoBehaviour
         hasParameters = true;
     }
 
+    // ------------------------------------------------------------------
+    // Full step (T-029)
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// Runs one complete simulation step and leaves the result in the other
+    /// particle buffer.
+    /// </summary>
+    /// <remarks>
+    /// Order matters at three points:
+    ///
+    ///   density -> pressure -> force -> viscosity -> reduce -> integrate
+    ///
+    /// - pressure needs density; viscosity reads _Force and adds to it.
+    /// - the reduction runs after forces and before integration, so max||v|| and
+    ///   max||a|| describe the same pre-integration state the CPU measures.
+    /// - integration writes the other particle buffer, so the swap at the end is
+    ///   what makes the new state the current one.
+    ///
+    /// Nothing here reads back to the CPU.
+    /// </remarks>
+    public void StepOnce(float dt)
+    {
+        if (!ready || !hasParameters) return;
+
+        DispatchDensityPressure();
+        DispatchForces();
+        DispatchReduceExtremes();
+        DispatchIntegrate(dt);
+
+        SwapParticles();
+    }
+
+    /// <summary>Makes the most recently written particle buffer the current one.</summary>
+    public void SwapParticles()
+    {
+        current = 1 - current;
+    }
+
+    // ------------------------------------------------------------------
+    // Dispatch
+    // ------------------------------------------------------------------
+
     /// <summary>Dispatches the probe kernel over the whole capacity.</summary>
     public void DispatchProbe()
     {
         if (!ready) return;
 
-        shader.SetBuffer(probeKernel, "_ParticlesIn", particlesIn);
-        shader.SetBuffer(probeKernel, "_ParticlesOut", particlesOut);
+        shader.SetBuffer(probeKernel, "_ParticlesIn", ParticlesIn);
+        shader.SetBuffer(probeKernel, "_ParticlesOut", ParticlesOut);
         shader.SetBuffer(probeKernel, "_BoundaryPositions", boundary);
 
         shader.SetInt("_ParticleCount", particleCapacity);
@@ -251,7 +333,7 @@ public class SPHCompute : MonoBehaviour
 
         SetParameterUniforms();
 
-        shader.SetBuffer(densityKernel, "_ParticlesIn", particlesIn);
+        shader.SetBuffer(densityKernel, "_ParticlesIn", ParticlesIn);
         shader.SetBuffer(densityKernel, "_BoundaryPositions", boundary);
         shader.SetBuffer(densityKernel, "_Density", density);
         shader.SetBuffer(densityKernel, "_NearDensity", nearDensity);
@@ -279,7 +361,7 @@ public class SPHCompute : MonoBehaviour
 
         SetParameterUniforms();
 
-        shader.SetBuffer(forceKernel, "_ParticlesIn", particlesIn);
+        shader.SetBuffer(forceKernel, "_ParticlesIn", ParticlesIn);
         shader.SetBuffer(forceKernel, "_BoundaryPositions", boundary);
         shader.SetBuffer(forceKernel, "_Density", density);
         shader.SetBuffer(forceKernel, "_NearDensity", nearDensity);
@@ -288,15 +370,33 @@ public class SPHCompute : MonoBehaviour
         shader.SetBuffer(forceKernel, "_Force", force);
         shader.Dispatch(forceKernel, GroupCount(), 1, 1);
 
-        shader.SetBuffer(viscosityKernel, "_ParticlesIn", particlesIn);
+        shader.SetBuffer(viscosityKernel, "_ParticlesIn", ParticlesIn);
         shader.SetBuffer(viscosityKernel, "_ViscosityForce", viscosityForce);
         shader.SetBuffer(viscosityKernel, "_Force", force);
         shader.Dispatch(viscosityKernel, GroupCount(), 1, 1);
     }
 
+    /// <summary>Reduces max speed and max acceleration into the two-slot buffer.</summary>
+    public void DispatchReduceExtremes()
+    {
+        if (!ready || !hasParameters) return;
+
+        shader.Dispatch(clearExtremesKernel, 1, 1, 1);
+
+        shader.SetBuffer(reduceExtremesKernel, "_ParticlesIn", ParticlesIn);
+        shader.SetBuffer(reduceExtremesKernel, "_Density", density);
+        shader.SetBuffer(reduceExtremesKernel, "_Force", force);
+        shader.SetBuffer(reduceExtremesKernel, "_Extremes", extremes);
+
+        shader.SetInt("_ParticleCount", particleCapacity);
+        shader.SetVector("_Gravity", new Vector4(parameters.gravity.x, parameters.gravity.y, 0f, 0f));
+
+        shader.Dispatch(reduceExtremesKernel, GroupCount(), 1, 1);
+    }
+
     /// <summary>
     /// Integrates one step of semi-implicit Euler and writes the new state into
-    /// the output particle buffer.
+    /// the other particle buffer.
     /// </summary>
     public void DispatchIntegrate(float dt)
     {
@@ -305,8 +405,8 @@ public class SPHCompute : MonoBehaviour
         SetParameterUniforms();
         shader.SetFloat("_DeltaTime", dt);
 
-        shader.SetBuffer(integrateKernel, "_ParticlesIn", particlesIn);
-        shader.SetBuffer(integrateKernel, "_ParticlesOut", particlesOut);
+        shader.SetBuffer(integrateKernel, "_ParticlesIn", ParticlesIn);
+        shader.SetBuffer(integrateKernel, "_ParticlesOut", ParticlesOut);
         shader.SetBuffer(integrateKernel, "_Density", density);
         shader.SetBuffer(integrateKernel, "_Force", force);
         shader.Dispatch(integrateKernel, GroupCount(), 1, 1);
@@ -344,12 +444,97 @@ public class SPHCompute : MonoBehaviour
         shader.SetInt("_UseBoundaryParticles", parameters.useBoundaryParticles ? 1 : 0);
     }
 
-    /// <summary>Copies the kernel's output buffer back into managed-visible memory.</summary>
+    // ------------------------------------------------------------------
+    // Readback
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// Requests the extremes reduction asynchronously. Called once per frame, not
+    /// once per step: a second request while one is in flight is skipped rather
+    /// than queued, so the pipeline never builds a backlog of readbacks.
+    /// </summary>
+    /// <remarks>
+    /// Poll-based rather than callback-based. A callback only fires while the
+    /// player loop is pumping, which makes it untestable outside play mode; the
+    /// poll can be driven explicitly, so the readback itself is covered by tests.
+    /// </remarks>
+    public void RequestExtremesReadback()
+    {
+        if (!ready || extremesPending) return;
+
+        extremesPending = true;
+        extremesRequest = AsyncGPUReadback.Request(extremes);
+    }
+
+    private void Update() => PollExtremesReadback();
+
+    /// <summary>Consumes the pending readback once the GPU has finished with it.</summary>
+    public void PollExtremesReadback()
+    {
+        if (!extremesPending || !extremesRequest.done) return;
+
+        ConsumeExtremes();
+    }
+
+    /// <summary>
+    /// Blocks until the pending readback completes, then consumes it. Test and
+    /// diagnostic use only: the per-frame path is <see cref="PollExtremesReadback"/>,
+    /// which never stalls.
+    /// </summary>
+    public bool TryConsumeExtremesBlocking(out float maxSpeed, out float maxAccel)
+    {
+        maxSpeed = 0f;
+        maxAccel = 0f;
+
+        if (!extremesPending) return false;
+
+        extremesRequest.WaitForCompletion();
+        ConsumeExtremes();
+
+        maxSpeed = LastMaxSpeed;
+        maxAccel = LastMaxAccel;
+        return true;
+    }
+
+    private void ConsumeExtremes()
+    {
+        extremesPending = false;
+
+        // On failure keep the previous estimate rather than falling back to zero,
+        // which would silently produce a much larger dt.
+        if (extremesRequest.hasError) return;
+
+        NativeArray<uint> data = extremesRequest.GetData<uint>();
+        if (data.Length < 2) return;
+
+        LastMaxSpeed = math.asfloat(data[0]);
+        LastMaxAccel = math.asfloat(data[1]);
+    }
+
+    /// <summary>
+    /// Reads the extremes buffer synchronously. Test and diagnostic use only: the
+    /// per-frame path is <see cref="RequestExtremesReadback"/>, which does not stall.
+    /// </summary>
+    public void ReadbackExtremes(out float maxSpeed, out float maxAccel)
+    {
+        maxSpeed = 0f;
+        maxAccel = 0f;
+
+        if (!ready) return;
+
+        if (extremesScratch == null) extremesScratch = new uint[2];
+        extremes.GetData(extremesScratch, 0, 0, 2);
+
+        maxSpeed = math.asfloat(extremesScratch[0]);
+        maxAccel = math.asfloat(extremesScratch[1]);
+    }
+
+    /// <summary>Copies the current particle state back into managed-visible memory.</summary>
     /// <remarks>
     /// The destination must hold the whole buffer. ComputeBuffer in this Unity
     /// version exposes GetData only for managed arrays, not for NativeArray, so
-    /// the copy goes buffer -> managed scratch -> NativeArray. That is one extra
-    /// copy, which is acceptable here because T-029 deletes this path.
+    /// the copy goes buffer -> managed scratch -> NativeArray. T-032 replaces this
+    /// with rendering straight from the buffer.
     /// </remarks>
     public void Readback(NativeArray<Particle2D> into)
     {
@@ -367,7 +552,7 @@ public class SPHCompute : MonoBehaviour
             readbackScratch = new Particle2D[particleCapacity];
         }
 
-        particlesOut.GetData(readbackScratch, 0, 0, particleCapacity);
+        ParticlesIn.GetData(readbackScratch, 0, 0, particleCapacity);
         NativeArray<Particle2D>.Copy(readbackScratch, into, particleCapacity);
     }
 
@@ -437,17 +622,13 @@ public class SPHCompute : MonoBehaviour
         NativeArray<float2>.Copy(vectorScratch, into, particleCapacity);
     }
 
+    // ------------------------------------------------------------------
+    // Self test (T-026)
+    // ------------------------------------------------------------------
+
     /// <summary>
     /// Pushes a known pattern through the GPU and checks what comes back.
     /// </summary>
-    /// <remarks>
-    /// Verifies three things at once, because they fail in different ways. The
-    /// position check proves the read and write buffers are both bound and that
-    /// the whole queue actually executed. The force check proves the static
-    /// boundary buffer is bound and readable. The density check proves the scalar
-    /// constant path works. The last two would otherwise stay invisible until
-    /// density is computed from walls in T-027.
-    /// </remarks>
     public bool RunRoundTripSelfTest(int count, out string report)
     {
         count = Mathf.Max(1, count);
@@ -487,6 +668,9 @@ public class SPHCompute : MonoBehaviour
             UploadParticles(input);
             UploadBoundary(wall);
             DispatchProbe();
+
+            // The probe writes the other buffer, so make it current before reading.
+            SwapParticles();
             Readback(output);
 
             for (int i = 0; i < count; i++)
@@ -542,30 +726,33 @@ public class SPHCompute : MonoBehaviour
     /// </summary>
     public void Release()
     {
-        particlesIn?.Release();
-        particlesOut?.Release();
-        boundary?.Release();
+        for (int i = 0; i < particleBuffers.Length; i++)
+        {
+            particleBuffers[i]?.Release();
+            particleBuffers[i] = null;
+        }
 
+        boundary?.Release();
         density?.Release();
         nearDensity?.Release();
         pressure?.Release();
         nearPressure?.Release();
         force?.Release();
         viscosityForce?.Release();
+        extremes?.Release();
 
-        particlesIn = null;
-        particlesOut = null;
         boundary = null;
-
         density = null;
         nearDensity = null;
         pressure = null;
         nearPressure = null;
         force = null;
         viscosityForce = null;
+        extremes = null;
 
         boundaryCapacity = 0;
         BoundaryCount = 0;
+        current = 0;
 
         probeKernel = -1;
         densityKernel = -1;
@@ -573,11 +760,15 @@ public class SPHCompute : MonoBehaviour
         forceKernel = -1;
         viscosityKernel = -1;
         integrateKernel = -1;
+        clearExtremesKernel = -1;
+        reduceExtremesKernel = -1;
 
         readbackScratch = null;
         scalarScratch = null;
         vectorScratch = null;
+        extremesScratch = null;
 
+        extremesPending = false;
         hasParameters = false;
         ready = false;
     }
