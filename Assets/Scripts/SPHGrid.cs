@@ -81,13 +81,13 @@ public struct SPHGrid : IDisposable
     /// because growth can replace the underlying arrays.
     /// </summary>
     public NeighborLists Rebuild(
-        NativeArray<Particle2D> fluid,
+        NativeArray<float2> positions,
         NativeArray<float2> boundary,
         float2 domainOrigin,
         float2 domainSize,
         float smoothingLength)
     {
-        fluidCount = fluid.Length;
+        fluidCount = positions.Length;
         boundaryCount = boundary.IsCreated ? boundary.Length : 0;
         totalCount = fluidCount + boundaryCount;
 
@@ -107,14 +107,14 @@ public struct SPHGrid : IDisposable
         EnsureNeighborStartStorage();
 
         SPHGridOps.BuildCells(
-            fluid, boundary,
+            positions, boundary,
             packedCell, cellStart, cellCursor, sortedByCell,
             geometry, fluidCount, boundaryCount, totalCount);
 
         // Count neighbours, then turn the counts into start offsets.
         // CountNeighbors writes counts into start[i + 1], leaving start[0] as 0.
         SPHGridOps.CountNeighbors(
-            fluid, boundary,
+            positions, boundary,
             sortedByCell, cellStart,
             fluidStart, boundaryStart,
             geometry, fluidCount, totalCount, radiusSq);
@@ -125,7 +125,7 @@ public struct SPHGrid : IDisposable
         EnsureNeighborListStorage(fluidStart[fluidCount], boundaryStart[fluidCount]);
 
         SPHGridOps.FillNeighbors(
-            fluid, boundary,
+            positions, boundary,
             sortedByCell, cellStart,
             fluidStart, fluidList,
             boundaryStart, boundaryList,
@@ -258,7 +258,7 @@ public static class SPHGridOps
 {
     [BurstCompile]
     public static void BuildCells(
-        in NativeArray<Particle2D> fluid,
+        in NativeArray<float2> positions,
         in NativeArray<float2> boundary,
         NativeArray<int> packedCell,
         NativeArray<int> cellStart,
@@ -272,7 +272,7 @@ public static class SPHGridOps
         // 1. Cell index per packed particle
         for (int i = 0; i < fluidCount; i++)
         {
-            packedCell[i] = CellOf(fluid[i].position, g);
+            packedCell[i] = CellOf(positions[i], g);
         }
 
         for (int b = 0; b < boundaryCount; b++)
@@ -314,7 +314,7 @@ public static class SPHGridOps
 
     [BurstCompile]
     public static void CountNeighbors(
-        in NativeArray<Particle2D> fluid,
+        in NativeArray<float2> positions,
         in NativeArray<float2> boundary,
         in NativeArray<int> sortedByCell,
         in NativeArray<int> cellStart,
@@ -327,7 +327,7 @@ public static class SPHGridOps
     {
         for (int i = 0; i < fluidCount; i++)
         {
-            float2 posI = fluid[i].position;
+            float2 posI = positions[i];
             int cx = ColumnOf(posI.x, g);
             int cy = RowOf(posI.y, g);
 
@@ -354,7 +354,7 @@ public static class SPHGridOps
                         if (packed < fluidCount)
                         {
                             if (packed == i) continue;
-                            if (math.distancesq(fluid[packed].position, posI) < radiusSq) fluidFound++;
+                            if (math.distancesq(positions[packed], posI) < radiusSq) fluidFound++;
                         }
                         else
                         {
@@ -372,7 +372,7 @@ public static class SPHGridOps
 
     [BurstCompile]
     public static void FillNeighbors(
-        in NativeArray<Particle2D> fluid,
+        in NativeArray<float2> positions,
         in NativeArray<float2> boundary,
         in NativeArray<int> sortedByCell,
         in NativeArray<int> cellStart,
@@ -388,7 +388,7 @@ public static class SPHGridOps
 
         for (int i = 0; i < fluidCount; i++)
         {
-            float2 posI = fluid[i].position;
+            float2 posI = positions[i];
             int cx = ColumnOf(posI.x, g);
             int cy = RowOf(posI.y, g);
 
@@ -414,7 +414,7 @@ public static class SPHGridOps
                         if (packed < fluidCount)
                         {
                             if (packed == i) continue;
-                            if (math.distancesq(fluid[packed].position, posI) < radiusSq)
+                            if (math.distancesq(positions[packed], posI) < radiusSq)
                             {
                                 fluidList[fluidWrite++] = packed;
                             }

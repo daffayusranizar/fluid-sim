@@ -1,4 +1,5 @@
 using Unity.Collections;
+using Unity.Jobs;
 using Unity.Mathematics;
 using UnityEngine;
 
@@ -36,6 +37,10 @@ public class SPH2D : MonoBehaviour
     [Range(0.05f, 0.5f)] public float cflFactor = 0.25f;
     public float minTimeStep = 0.0002f;
     public float maxTimeStep = 0.02f;
+
+    [Tooltip("Particles per job batch. Lower gives a more even spread across " +
+             "cores but adds scheduling overhead; raise it until gains flatten out.")]
+    public int batchCount = 64;
 
     [Header("Spawn")]
     // Fraction of boxSize the fluid starts in, per axis. The classic dam break is
@@ -83,7 +88,14 @@ public class SPH2D : MonoBehaviour
     public bool showParticleGizmos = true;
 
     // --- Native simulation state ---
-    private NativeArray<Particle2D> particles;
+    // Structure of arrays, so each pass writes one array and reads others with no
+    // overlap. See ParticleState for why that matters.
+    private ParticleState state;
+
+    // Packed Particle2D view for the renderer. Kept separate so the solver's
+    // memory layout can change without the shader's input changing with it.
+    private NativeArray<Particle2D> renderBuffer;
+
     private NativeArray<float2> boundaryParticles;
     private NativeArray<float2> viscosityForces;
     private NeighborLists neighbors;
@@ -112,12 +124,20 @@ public class SPH2D : MonoBehaviour
     /// Live particle state, exposed so the renderer can read it. Native and
     /// read-only by convention: nothing outside the solver writes these.
     /// </summary>
-    public NativeArray<Particle2D> Particles => particles;
+    public NativeArray<Particle2D> Particles => renderBuffer;
 
     private void Awake()
     {
-        particles = new NativeArray<Particle2D>(particleCount, Allocator.Persistent);
+        state = new ParticleState(particleCount, Allocator.Persistent);
+        renderBuffer = new NativeArray<Particle2D>(particleCount, Allocator.Persistent);
         viscosityForces = new NativeArray<float2>(particleCount, Allocator.Persistent);
+
+        // Must exist before any job is scheduled. Jobs cannot be handed an
+        // uncreated NativeArray, and mass calibration runs a density job before
+        // boundary particles are generated. Parked empty, so calibration sees
+        // fluid only -- which is what we want: the bulk fluid should land on
+        // restDensity, with walls reading slightly over-dense afterwards.
+        ParkDisabledBoundaryArray();
 
         SpawnParticles();
 
@@ -133,7 +153,8 @@ public class SPH2D : MonoBehaviour
 
     private void OnDestroy()
     {
-        if (particles.IsCreated) particles.Dispose();
+        state.Dispose();
+        if (renderBuffer.IsCreated) renderBuffer.Dispose();
         if (viscosityForces.IsCreated) viscosityForces.Dispose();
         if (boundaryParticles.IsCreated) boundaryParticles.Dispose();
 
@@ -265,7 +286,7 @@ public class SPH2D : MonoBehaviour
 
                 for (int k = 0; k < i; k++)
                 {
-                    if (math.distancesq(particles[k].position, candidate) < minDistSq)
+                    if (math.distancesq(state.position[k], candidate) < minDistSq)
                     {
                         accepted = false;
                         break;
@@ -275,14 +296,13 @@ public class SPH2D : MonoBehaviour
                 if (accepted) break;
             }
 
-            particles[i] = new Particle2D
-            {
-                position = candidate,
-                velocity = float2.zero,
-                force = float2.zero,
-                density = 0f,
-                pressure = 0f,
-            };
+            state.position[i] = candidate;
+            state.velocity[i] = float2.zero;
+            state.force[i] = float2.zero;
+            state.density[i] = 0f;
+            state.pressure[i] = 0f;
+            state.nearDensity[i] = 0f;
+            state.nearPressure[i] = 0f;
         }
     }
 
@@ -300,9 +320,9 @@ public class SPH2D : MonoBehaviour
         BuildSolverParams();
 
         RebuildNeighbors();
-        SPHSolver.ComputeDensity(particles, neighbors, BoundaryView(), solverParams);
+        RunDensityPass();
 
-        float meanDensity = SPHSolver.MeanDensity(particles);
+        float meanDensity = SPHSolver.MeanDensity(state.density);
 
         if (meanDensity > 0f)
         {
@@ -320,7 +340,7 @@ public class SPH2D : MonoBehaviour
     {
         if (!useBoundaryParticles)
         {
-            boundaryCount = 0;
+            ParkDisabledBoundaryArray();
             return;
         }
 
@@ -361,8 +381,14 @@ public class SPH2D : MonoBehaviour
         if (boundaryParticles.IsCreated) boundaryParticles.Dispose();
 
         boundaryCount = found.Count;
-        boundaryParticles = new NativeArray<float2>(
-            Mathf.Max(1, boundaryCount), Allocator.Persistent);
+
+        if (boundaryCount == 0)
+        {
+            ParkDisabledBoundaryArray();
+            return;
+        }
+
+        boundaryParticles = new NativeArray<float2>(boundaryCount, Allocator.Persistent);
 
         for (int i = 0; i < boundaryCount; i++)
         {
@@ -371,7 +397,29 @@ public class SPH2D : MonoBehaviour
 
         // Static, so one snapshot at spawn is enough for the debug renderer
         renderBoundary = new float2[boundaryCount];
-        boundaryParticles.GetSubArray(0, boundaryCount).CopyTo(renderBoundary);
+        boundaryParticles.CopyTo(renderBoundary);
+    }
+
+    /// <summary>
+    /// Keeps a one-element boundary array around when there are no boundary
+    /// particles, so jobs are never handed an uncreated NativeArray.
+    /// </summary>
+    /// <remarks>
+    /// The slot is parked far outside the domain, so it can never fall inside a
+    /// particle's smoothing radius and never contribute density or force. That is
+    /// simpler and less fragile than passing a zero-length slice around, and it
+    /// means the disabled case needs no special path in the solver.
+    /// </remarks>
+    private void ParkDisabledBoundaryArray()
+    {
+        boundaryCount = 0;
+
+        if (boundaryParticles.IsCreated) boundaryParticles.Dispose();
+
+        boundaryParticles = new NativeArray<float2>(1, Allocator.Persistent);
+        boundaryParticles[0] = new float2(1e9f, 1e9f);
+
+        renderBoundary = new float2[0];
     }
 
     /// <summary>
@@ -381,12 +429,13 @@ public class SPH2D : MonoBehaviour
     /// </summary>
     private NativeArray<float2> BoundaryView()
     {
-        if (!boundaryParticles.IsCreated || !useBoundaryParticles)
-        {
-            return new NativeArray<float2>();
-        }
+        // Always a live array even when boundary particles are disabled, because
+        // jobs cannot take an uncreated NativeArray. Self-healing rather than
+        // relying on Awake ordering: getting this wrong throws at schedule time
+        // with a message that says nothing about boundary particles.
+        if (!boundaryParticles.IsCreated) ParkDisabledBoundaryArray();
 
-        return boundaryParticles.GetSubArray(0, boundaryCount);
+        return boundaryParticles;
     }
 
     private void RebuildNeighbors()
@@ -402,7 +451,7 @@ public class SPH2D : MonoBehaviour
             center.y - domainSize.y * 0.5f);
 
         neighbors = grid.Rebuild(
-            particles,
+            state.position,
             BoundaryView(),
             domainOrigin,
             new float2(domainSize.x, domainSize.y),
@@ -411,7 +460,7 @@ public class SPH2D : MonoBehaviour
 
     private void Update()
     {
-        if (!particles.IsCreated) return;
+        if (!state.IsCreated) return;
 
         BuildSolverParams();
 
@@ -431,13 +480,13 @@ public class SPH2D : MonoBehaviour
             // Size the next step from the state we just produced, then never step
             // past the remaining budget so the simulation stays in sync with time.
             float dt = Mathf.Clamp(
-                SPHSolver.ComputeStableTimeStep(particles, solverParams, cflFactor),
+                SPHSolver.ComputeStableTimeStep(state, solverParams, cflFactor),
                 minTimeStep, maxTimeStep);
 
             dt = Mathf.Min(dt, timeAccumulator);
             lastStepSize = dt;
 
-            SPHSolver.Integrate(particles, solverParams, dt);
+            RunIntegratePass(dt);
 
             timeAccumulator -= dt;
             steps++;
@@ -450,9 +499,12 @@ public class SPH2D : MonoBehaviour
         solverTimer.Stop();
         lastSolverMs = solverTimer.Elapsed.TotalMilliseconds;
 
+        // Refresh the render view every frame, independently of the gizmos.
+        RunRepack();
+
         if (debugLogs)
         {
-            SPHSolver.Diagnostics(particles, solverParams,
+            SPHSolver.Diagnostics(state, solverParams,
                 out float meanDensity, out float maxSpeed, out float maxAccel);
 
             Debug.Log(
@@ -466,16 +518,123 @@ public class SPH2D : MonoBehaviour
     }
 
     /// <summary>One full solver pass: neighbours, density, pressure, forces.</summary>
+    /// <summary>
+    /// Schedules every solver pass for one step and waits for them to finish.
+    /// </summary>
+    /// <remarks>
+    /// The passes form two chains that meet at the force accumulation:
+    ///
+    ///   ResetForces ..........................\
+    ///                                          +--> PressureForce --> Viscosity
+    ///   Density --> Pressure ................/
+    ///
+    /// Dependencies rather than fusion keep each pass comparable to the serial
+    /// version it replaced, at the cost of one extra scheduling step.
+    /// </remarks>
     private void SolveStep()
     {
         RebuildNeighbors();
 
-        SPHSolver.ComputeDensity(particles, neighbors, BoundaryView(), solverParams);
-        SPHSolver.ComputePressure(particles, solverParams);
+        int count = state.Count;
+        int batch = Mathf.Max(1, batchCount);
+        NativeArray<float2> boundary = BoundaryView();
 
-        SPHSolver.ResetForces(particles);
-        SPHSolver.ComputePressureForce(particles, neighbors, BoundaryView(), solverParams);
-        SPHSolver.ComputeViscosityForce(particles, neighbors, solverParams, viscosityForces);
+        JobHandle density = new ComputeDensityJob
+        {
+            position = state.position,
+            neighbors = neighbors,
+            boundaryPositions = boundary,
+            density = state.density,
+            nearDensity = state.nearDensity,
+            p = solverParams,
+        }.Schedule(count, batch);
+
+        JobHandle pressure = new ComputePressureJob
+        {
+            density = state.density,
+            nearDensity = state.nearDensity,
+            pressure = state.pressure,
+            nearPressure = state.nearPressure,
+            p = solverParams,
+        }.Schedule(count, batch, density);
+
+        JobHandle reset = new ResetForcesJob
+        {
+            force = state.force,
+        }.Schedule(count, batch);
+
+        JobHandle pressureForce = new ComputePressureForceJob
+        {
+            position = state.position,
+            density = state.density,
+            pressure = state.pressure,
+            nearDensity = state.nearDensity,
+            nearPressure = state.nearPressure,
+            neighbors = neighbors,
+            boundaryPositions = boundary,
+            force = state.force,
+            p = solverParams,
+        }.Schedule(count, batch, JobHandle.CombineDependencies(reset, pressure));
+
+        JobHandle viscosity = new ComputeViscosityJob
+        {
+            position = state.position,
+            velocity = state.velocity,
+            neighbors = neighbors,
+            viscosityForce = viscosityForces,
+            force = state.force,
+            p = solverParams,
+        }.Schedule(count, batch, pressureForce);
+
+        viscosity.Complete();
+    }
+
+    /// <summary>Density only. Used once at spawn to calibrate particle mass.</summary>
+    private void RunDensityPass()
+    {
+        new ComputeDensityJob
+        {
+            position = state.position,
+            neighbors = neighbors,
+            boundaryPositions = BoundaryView(),
+            density = state.density,
+            nearDensity = state.nearDensity,
+            p = solverParams,
+        }.Schedule(state.Count, Mathf.Max(1, batchCount)).Complete();
+    }
+
+    /// <summary>
+    /// Integration is scheduled apart from the rest of the step because dt depends
+    /// on the forces those passes just produced. Batching it together would mean
+    /// sizing dt from the previous step, which lags the state.
+    /// </summary>
+    private void RunIntegratePass(float dt)
+    {
+        new IntegrateJob
+        {
+            position = state.position,
+            velocity = state.velocity,
+            force = state.force,
+            density = state.density,
+            p = solverParams,
+            dt = dt,
+        }.Schedule(state.Count, Mathf.Max(1, batchCount)).Complete();
+    }
+
+    /// <summary>Refreshes the packed Particle2D view the renderer uploads.</summary>
+    private void RunRepack()
+    {
+        new RepackRenderBufferJob
+        {
+            position = state.position,
+            velocity = state.velocity,
+            force = state.force,
+            density = state.density,
+            pressure = state.pressure,
+            nearDensity = state.nearDensity,
+            nearPressure = state.nearPressure,
+            render = renderBuffer,
+        }.Schedule(state.Count, Mathf.Max(1, batchCount)).Complete();
     }
 
     // ------------------------------------------------------------------
@@ -488,12 +647,14 @@ public class SPH2D : MonoBehaviour
     /// </summary>
     private void RefreshRenderSnapshot()
     {
-        if (renderParticles == null || renderParticles.Length != particles.Length)
+        if (!renderBuffer.IsCreated) return;
+
+        if (renderParticles == null || renderParticles.Length != renderBuffer.Length)
         {
-            renderParticles = new Particle2D[particles.Length];
+            renderParticles = new Particle2D[renderBuffer.Length];
         }
 
-        particles.CopyTo(renderParticles);
+        renderBuffer.CopyTo(renderParticles);
 
         if (viscosityForces.IsCreated)
         {
@@ -508,7 +669,7 @@ public class SPH2D : MonoBehaviour
 
     private void OnDrawGizmos()
     {
-        if (!particles.IsCreated) return;
+        if (!renderBuffer.IsCreated) return;
 
         RefreshRenderSnapshot();
 
