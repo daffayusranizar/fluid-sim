@@ -5,10 +5,10 @@ using UnityEngine;
 /// <summary>
 /// Owner of the GPU-side particle buffers and dispatch.
 ///
-/// T-026 is plumbing only: allocate, upload, dispatch one kernel, read back.
-/// Physics is deliberately absent — T-027 adds density and pressure, T-028 adds
-/// forces and integration, T-029 removes the per-frame readback. Keeping the data
-/// flow separate from the physics is what makes each of those a small change.
+/// T-026 built the plumbing (allocate, upload, dispatch, read back). T-027 adds
+/// the first physics: a density kernel and a pressure kernel that mirror the
+/// CPU's two jobs one for one, so the two implementations can be compared on
+/// identical input. T-028 adds forces, T-029 removes the per-frame readback.
 ///
 /// The GPU layout mirrors <see cref="ParticleState"/> on purpose: one structured
 /// buffer holding the same 40-byte Particle2D the renderer already consumes. That
@@ -28,7 +28,9 @@ public class SPHCompute : MonoBehaviour
     /// <summary>Must match [numthreads(...)] in SPH2D.compute.</summary>
     public const int ThreadGroupSize = 64;
 
-    private const string ProbeKernel = "ProbeRoundTrip";
+    private const string ProbeKernelName = "ProbeRoundTrip";
+    private const string DensityKernelName = "ComputeDensity";
+    private const string PressureKernelName = "ComputePressure";
 
     /// <summary>
     /// Displacement the probe kernel applies to every position. Passed to the
@@ -36,7 +38,8 @@ public class SPHCompute : MonoBehaviour
     /// </summary>
     public static readonly float2 ProbeOffset = new float2(0.125f, -0.25f);
 
-    [Tooltip("Compute shader asset. Needs the ProbeRoundTrip kernel.")]
+    [Tooltip("Compute shader asset. Needs the ProbeRoundTrip, ComputeDensity and " +
+             "ComputePressure kernels.")]
     public ComputeShader shader;
 
     [Tooltip("Particle capacity. Buffers are allocated to this by Initialize().")]
@@ -54,13 +57,27 @@ public class SPHCompute : MonoBehaviour
     private ComputeBuffer particlesOut;
     private ComputeBuffer boundary;
 
+    // Density and pressure, kept out of the Particle struct so no pass writes a
+    // field another thread is reading. See the note in SPH2D.compute.
+    private ComputeBuffer density;
+    private ComputeBuffer nearDensity;
+    private ComputeBuffer pressure;
+    private ComputeBuffer nearPressure;
+
+    private int probeKernel = -1;
+    private int densityKernel = -1;
+    private int pressureKernel = -1;
+
+    private int boundaryCapacity;
+    private bool ready;
+
+    private SolverParams parameters;
+    private bool hasParameters;
+
     // Reused between readbacks so the one unavoidable managed hop does not
     // allocate every frame. T-029 removes the readback entirely.
     private Particle2D[] readbackScratch;
-
-    private int kernel = -1;
-    private int boundaryCapacity;
-    private bool ready;
+    private float[] scalarScratch;
 
     public bool IsReady => ready;
     public int ParticleCapacity => particleCapacity;
@@ -86,7 +103,7 @@ public class SPHCompute : MonoBehaviour
     /// <remarks>
     /// Returns false and logs why, rather than leaving a half-built pipeline that
     /// only fails later inside a dispatch. A compute shader asset can load while
-    /// still missing the kernel (renamed in HLSL, stripped by a pragma typo), and
+    /// still missing a kernel (renamed in HLSL, stripped by a pragma typo), and
     /// that failure should surface at setup, not mid-simulation.
     /// </remarks>
     public bool Initialize(int capacity)
@@ -97,19 +114,29 @@ public class SPHCompute : MonoBehaviour
             return false;
         }
 
-        if (!shader.HasKernel(ProbeKernel))
+        foreach (string name in new[] { ProbeKernelName, DensityKernelName, PressureKernelName })
         {
-            Debug.LogError($"SPHCompute: compute shader has no '{ProbeKernel}' kernel.");
-            return false;
+            if (!shader.HasKernel(name))
+            {
+                Debug.LogError($"SPHCompute: compute shader has no '{name}' kernel.");
+                return false;
+            }
         }
 
         Release();
 
         particleCapacity = Mathf.Max(1, capacity);
-        kernel = shader.FindKernel(ProbeKernel);
+        probeKernel = shader.FindKernel(ProbeKernelName);
+        densityKernel = shader.FindKernel(DensityKernelName);
+        pressureKernel = shader.FindKernel(PressureKernelName);
 
         particlesIn = new ComputeBuffer(particleCapacity, ParticleStride, ComputeBufferType.Structured);
         particlesOut = new ComputeBuffer(particleCapacity, ParticleStride, ComputeBufferType.Structured);
+
+        density = new ComputeBuffer(particleCapacity, sizeof(float), ComputeBufferType.Structured);
+        nearDensity = new ComputeBuffer(particleCapacity, sizeof(float), ComputeBufferType.Structured);
+        pressure = new ComputeBuffer(particleCapacity, sizeof(float), ComputeBufferType.Structured);
+        nearPressure = new ComputeBuffer(particleCapacity, sizeof(float), ComputeBufferType.Structured);
 
         // Park a one-element boundary buffer immediately. The kernel reads element
         // zero unconditionally, so it must never be null, and a zero-length
@@ -160,21 +187,86 @@ public class SPHCompute : MonoBehaviour
         if (positions.Length > 0) boundary.SetData(positions);
     }
 
+    /// <summary>
+    /// Caches the solver parameters the kernels read as shader constants.
+    /// </summary>
+    /// <remarks>
+    /// Takes the CPU's own <see cref="SolverParams"/> rather than a parallel set
+    /// of fields, so there is one definition of what h, the kernel constants and
+    /// the EOS coefficients mean. This is the struct T-026's comment predicted
+    /// would become the constant block almost verbatim; the only change is that
+    /// the two bools cross the boundary as 0/1.
+    /// </remarks>
+    public void UploadParameters(in SolverParams p)
+    {
+        parameters = p;
+        hasParameters = true;
+    }
+
     /// <summary>Dispatches the probe kernel over the whole capacity.</summary>
     public void DispatchProbe()
     {
         if (!ready) return;
 
-        shader.SetBuffer(kernel, "_ParticlesIn", particlesIn);
-        shader.SetBuffer(kernel, "_ParticlesOut", particlesOut);
-        shader.SetBuffer(kernel, "_BoundaryPositions", boundary);
+        shader.SetBuffer(probeKernel, "_ParticlesIn", particlesIn);
+        shader.SetBuffer(probeKernel, "_ParticlesOut", particlesOut);
+        shader.SetBuffer(probeKernel, "_BoundaryPositions", boundary);
 
         shader.SetInt("_ParticleCount", particleCapacity);
         shader.SetFloat("_BoundaryVolume", boundaryVolume);
         shader.SetVector("_ProbeOffset", new Vector4(ProbeOffset.x, ProbeOffset.y, 0f, 0f));
 
-        int groups = (particleCapacity + ThreadGroupSize - 1) / ThreadGroupSize;
-        shader.Dispatch(kernel, groups, 1, 1);
+        shader.Dispatch(probeKernel, GroupCount(), 1, 1);
+    }
+
+    /// <summary>
+    /// Runs the density pass, then the pressure pass that consumes it.
+    /// </summary>
+    /// <remarks>
+    /// Two dispatches rather than one fused kernel, matching the CPU's split
+    /// ComputeDensityJob -> ComputePressureJob. The split is what makes "does the
+    /// GPU match the CPU" a per-stage question instead of a whole-pipeline one:
+    /// if density already differs, pressure cannot be trusted even if it looks
+    /// plausible.
+    /// </remarks>
+    public void DispatchDensityPressure()
+    {
+        if (!ready || !hasParameters) return;
+
+        SetParameterUniforms();
+
+        shader.SetBuffer(densityKernel, "_ParticlesIn", particlesIn);
+        shader.SetBuffer(densityKernel, "_BoundaryPositions", boundary);
+        shader.SetBuffer(densityKernel, "_Density", density);
+        shader.SetBuffer(densityKernel, "_NearDensity", nearDensity);
+        shader.Dispatch(densityKernel, GroupCount(), 1, 1);
+
+        shader.SetBuffer(pressureKernel, "_Density", density);
+        shader.SetBuffer(pressureKernel, "_NearDensity", nearDensity);
+        shader.SetBuffer(pressureKernel, "_Pressure", pressure);
+        shader.SetBuffer(pressureKernel, "_NearPressure", nearPressure);
+        shader.Dispatch(pressureKernel, GroupCount(), 1, 1);
+    }
+
+    private void SetParameterUniforms()
+    {
+        shader.SetInt("_ParticleCount", particleCapacity);
+        shader.SetInt("_BoundaryCount", BoundaryCount);
+
+        shader.SetFloat("_SmoothingLength", parameters.smoothingLength);
+        shader.SetFloat("_SpikyPow2Const", parameters.spikyPow2Const);
+        shader.SetFloat("_SpikyPow3Const", parameters.spikyPow3Const);
+        shader.SetFloat("_RestDensity", parameters.restDensity);
+        shader.SetFloat("_ParticleMass", parameters.particleMass);
+        shader.SetFloat("_BoundaryVolume", parameters.boundaryVolume);
+        shader.SetFloat("_NearPressureMultiplier", parameters.nearPressureMultiplier);
+        shader.SetFloat("_Stiffness", parameters.stiffness);
+
+        // Bools cross as 0/1, matching how the CPU treats them. HLSL has no
+        // fixed-size bool, which is the same reason SolverParams needs
+        // [MarshalAs(UnmanagedType.U1)] for the Burst direct calls.
+        shader.SetInt("_ClampPressurePositive", parameters.clampPressurePositive ? 1 : 0);
+        shader.SetInt("_UseBoundaryParticles", parameters.useBoundaryParticles ? 1 : 0);
     }
 
     /// <summary>Copies the kernel's output buffer back into managed-visible memory.</summary>
@@ -202,6 +294,42 @@ public class SPHCompute : MonoBehaviour
 
         particlesOut.GetData(readbackScratch, 0, 0, particleCapacity);
         NativeArray<Particle2D>.Copy(readbackScratch, into, particleCapacity);
+    }
+
+    /// <summary>
+    /// Reads back the four scalar fields the density and pressure kernels write.
+    /// Each destination must hold the whole buffer.
+    /// </summary>
+    public void ReadbackScalars(
+        NativeArray<float> outDensity,
+        NativeArray<float> outNearDensity,
+        NativeArray<float> outPressure,
+        NativeArray<float> outNearPressure)
+    {
+        if (!ready) return;
+
+        if (scalarScratch == null || scalarScratch.Length != particleCapacity)
+        {
+            scalarScratch = new float[particleCapacity];
+        }
+
+        ReadScalar(density, outDensity);
+        ReadScalar(nearDensity, outNearDensity);
+        ReadScalar(pressure, outPressure);
+        ReadScalar(nearPressure, outNearPressure);
+    }
+
+    private void ReadScalar(ComputeBuffer buffer, NativeArray<float> into)
+    {
+        if (into.Length < particleCapacity)
+        {
+            Debug.LogError($"SPHCompute.ReadbackScalars: destination has {into.Length} slots " +
+                           $"but the buffer holds {particleCapacity}.");
+            return;
+        }
+
+        buffer.GetData(scalarScratch, 0, 0, particleCapacity);
+        NativeArray<float>.Copy(scalarScratch, into, particleCapacity);
     }
 
     /// <summary>
@@ -295,6 +423,11 @@ public class SPHCompute : MonoBehaviour
         return ok;
     }
 
+    private int GroupCount()
+    {
+        return (particleCapacity + ThreadGroupSize - 1) / ThreadGroupSize;
+    }
+
     private void OnDestroy() => Release();
 
     /// <summary>
@@ -308,14 +441,31 @@ public class SPHCompute : MonoBehaviour
         particlesOut?.Release();
         boundary?.Release();
 
+        density?.Release();
+        nearDensity?.Release();
+        pressure?.Release();
+        nearPressure?.Release();
+
         particlesIn = null;
         particlesOut = null;
         boundary = null;
-        readbackScratch = null;
+
+        density = null;
+        nearDensity = null;
+        pressure = null;
+        nearPressure = null;
 
         boundaryCapacity = 0;
         BoundaryCount = 0;
-        kernel = -1;
+
+        probeKernel = -1;
+        densityKernel = -1;
+        pressureKernel = -1;
+
+        readbackScratch = null;
+        scalarScratch = null;
+
+        hasParameters = false;
         ready = false;
     }
 }

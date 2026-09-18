@@ -1,17 +1,26 @@
 // GPU-side SPH pipeline.
 //
-// T-026 is data flow, not physics: the particle struct, the buffers, and one
-// kernel that proves a CPU -> GPU -> CPU round trip. Density and pressure arrive
-// in T-027, forces and integration in T-028, and the removal of the per-frame
-// readback in T-029.
+// T-026 built the plumbing: the particle struct, the buffers, and a round-trip
+// probe. T-027 adds the first physics -- density and pressure -- as two kernels
+// that mirror the CPU's two jobs one for one, so the two can be compared on
+// identical input. Forces and integration arrive in T-028, and the removal of
+// the per-frame readback in T-029.
 //
 // The struct must match Particle2D field for field. HLSL packs each float2 at
 // its natural 8-byte alignment, which lands every field at the same offset the
 // C# struct has, giving 40 bytes on both sides. That is also the stride
 // ParticleRenderer2D already uploads, so the buffer written here is the buffer
 // the renderer will read at T-032 with no repacking.
+//
+// The kernels are O(N^2): every thread loops every particle. That is deliberate
+// at this stage. A uniform grid on the GPU needs a count sort and prefix scan,
+// which is T-030/T-031, and doing it here would mean debugging hashing and
+// kernel math at the same time. Brute force produces the same numbers because
+// the kernel itself returns zero beyond h; the grid only avoids evaluating it.
 
 #pragma kernel ProbeRoundTrip
+#pragma kernel ComputeDensity
+#pragma kernel ComputePressure
 
 struct Particle
 {
@@ -33,9 +42,74 @@ RWStructuredBuffer<Particle> _ParticlesOut;
 // to use them. Decision recorded in docs/TASKS.md, GPU Port Decisions #2.
 StructuredBuffer<float2> _BoundaryPositions;
 
+// Density and pressure live in their own scalar buffers rather than in the
+// Particle struct's own fields. The density pass reads every particle and writes
+// only its own, so writing density back into Particle would have thread i writing
+// a field that thread j reads while computing its density. The value read is not
+// one this pass uses, so the race would be benign -- which is exactly the kind of
+// "benign" the CPU side removed in T-024 by moving to separate arrays. Same
+// reasoning, same answer.
+RWStructuredBuffer<float> _Density;
+RWStructuredBuffer<float> _NearDensity;
+RWStructuredBuffer<float> _Pressure;
+RWStructuredBuffer<float> _NearPressure;
+
 uint _ParticleCount;
+uint _BoundaryCount;
+
+// --- Solver parameters, mirroring SolverParams on the CPU ---
+float _SmoothingLength;
+float _SpikyPow2Const;      // main channel density
+float _SpikyPow3Const;      // near channel density
+float _RestDensity;
+float _ParticleMass;
 float _BoundaryVolume;
+float _NearPressureMultiplier;
+float _Stiffness;
+uint _ClampPressurePositive;
+uint _UseBoundaryParticles;
+
 float2 _ProbeOffset;
+
+// ----------------------------------------------------------------------
+// Kernels and equation of state. Direct transcriptions of SPHMath.cs, so a
+// divergence is a transcription bug rather than a design difference.
+// ----------------------------------------------------------------------
+
+float SpikyPow2Kernel(float r, float h, float k)
+{
+    if (r >= h) return 0.0;
+    float hr = h - r;
+    return k * hr * hr;
+}
+
+float SpikyPow3Kernel(float r, float h, float k)
+{
+    if (r >= h) return 0.0;
+    float hr = h - r;
+    return k * hr * hr * hr;
+}
+
+/// Tait equation of state, linear form. The clamp is a flag, not a constant:
+/// with the near channel active it must stay off, because the near pressure is a
+/// permanent outward push that only a negative main pressure can balance.
+float TaitPressure(float density, bool clampPositive)
+{
+    float p = _Stiffness * (density - _RestDensity);
+    if (clampPositive && p < 0.0) p = 0.0;
+    return p;
+}
+
+/// No rest-density offset by design: zero only when there are no close
+/// neighbours at all, and therefore never attractive.
+float NearPressure(float nearDensity)
+{
+    return _NearPressureMultiplier * nearDensity;
+}
+
+// ----------------------------------------------------------------------
+// Probe (T-026)
+// ----------------------------------------------------------------------
 
 [numthreads(64, 1, 1)]
 void ProbeRoundTrip(uint3 id : SV_DispatchThreadID)
@@ -55,11 +129,66 @@ void ProbeRoundTrip(uint3 id : SV_DispatchThreadID)
     p.position += _ProbeOffset;
 
     // Reads the boundary inputs so a missing or unbound binding fails here,
-    // loudly, instead of at T-028 where it would present as a density bug. This
-    // covers all three GPU input paths at once: the particle buffer, the static
-    // boundary buffer, and the single scalar constant.
+    // loudly, instead of at T-028 where it would present as a density bug.
     p.force = _BoundaryPositions[0];
     p.density = _BoundaryVolume;
 
     _ParticlesOut[i] = p;
+}
+
+// ----------------------------------------------------------------------
+// Density (T-027)
+// ----------------------------------------------------------------------
+
+[numthreads(64, 1, 1)]
+void ComputeDensity(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount) return;
+
+    float2 posI = _ParticlesIn[i].position;
+    float mainDensity = 0.0;
+    float near = 0.0;
+
+    for (uint j = 0; j < _ParticleCount; j++)
+    {
+        if (j == i) continue;
+
+        float r = distance(_ParticlesIn[j].position, posI);
+
+        mainDensity += _ParticleMass * SpikyPow2Kernel(r, _SmoothingLength, _SpikyPow2Const);
+        near += _ParticleMass * SpikyPow3Kernel(r, _SmoothingLength, _SpikyPow3Const);
+    }
+
+    // The wall contributes to the main channel only. Without this, roughly half
+    // of a particle's kernel support near a wall is missing, density collapses,
+    // pressure follows it, and particles weld themselves to the wall -- the
+    // T-020 bug, reintroduced on the GPU.
+    if (_UseBoundaryParticles != 0)
+    {
+        for (uint b = 0; b < _BoundaryCount; b++)
+        {
+            float r = distance(_BoundaryPositions[b], posI);
+
+            mainDensity += _RestDensity * _BoundaryVolume
+                           * SpikyPow2Kernel(r, _SmoothingLength, _SpikyPow2Const);
+        }
+    }
+
+    _Density[i] = mainDensity;
+    _NearDensity[i] = near;
+}
+
+// ----------------------------------------------------------------------
+// Pressure (T-027)
+// ----------------------------------------------------------------------
+
+[numthreads(64, 1, 1)]
+void ComputePressure(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount) return;
+
+    _Pressure[i] = TaitPressure(_Density[i], _ClampPressurePositive != 0);
+    _NearPressure[i] = NearPressure(_NearDensity[i]);
 }
