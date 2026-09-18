@@ -40,6 +40,24 @@ public class SPHCompute : MonoBehaviour
     private const string IntegrateKernelName = "Integrate";
     private const string ClearExtremesKernelName = "ClearExtremes";
     private const string ReduceExtremesKernelName = "ReduceExtremes";
+    private const string CellKeysKernelName = "ComputeCellKeys";
+
+    /// <summary>How a cell coordinate is turned into a bucket index.</summary>
+    public enum CellKeyMode
+    {
+        /// <summary>
+        /// Unique index into a dense grid. Collision-free, and the right choice for
+        /// this project: the domain is a bounded box, so a cell can never fall
+        /// outside the grid, and there are only ~N/4.5 cells to index.
+        /// </summary>
+        DirectIndex = 0,
+
+        /// <summary>
+        /// Prime-multiplier hash. The portable form for an unbounded domain, where
+        /// cell coordinates are arbitrary. Trades collisions for a fixed table.
+        /// </summary>
+        SpatialHash = 1,
+    }
 
     /// <summary>
     /// Displacement the probe kernel applies to every position. Passed to the
@@ -60,6 +78,14 @@ public class SPHCompute : MonoBehaviour
              "SPHComputeSimulation is driving the pipeline.")]
     public bool verifyOnStart = true;
 
+    [Tooltip("How a cell coordinate becomes a bucket index. DirectIndex is " +
+             "collision-free and smaller for this bounded box; SpatialHash is the " +
+             "portable form for an unbounded domain.")]
+    public CellKeyMode keyMode = CellKeyMode.DirectIndex;
+
+    [Tooltip("Hash bucket count when keyMode is SpatialHash. 0 derives 2N+1.")]
+    public int hashTableSize = 0;
+
     // Ping-pong state. Two buffers, because Integrate reads the current particle
     // and writes the next one; with a single buffer every thread would be reading
     // a slot another thread is overwriting.
@@ -79,6 +105,9 @@ public class SPHCompute : MonoBehaviour
 
     private ComputeBuffer extremes;
 
+    private ComputeBuffer cellKeys;
+    private ComputeBuffer cellCoords;
+
     private int probeKernel = -1;
     private int densityKernel = -1;
     private int pressureKernel = -1;
@@ -87,6 +116,7 @@ public class SPHCompute : MonoBehaviour
     private int integrateKernel = -1;
     private int clearExtremesKernel = -1;
     private int reduceExtremesKernel = -1;
+    private int cellKeysKernel = -1;
 
     private int boundaryCapacity;
     private bool ready;
@@ -103,6 +133,8 @@ public class SPHCompute : MonoBehaviour
     private float[] scalarScratch;
     private float2[] vectorScratch;
     private uint[] extremesScratch;
+    private uint[] keyScratch;
+    private int2[] coordScratch;
 
     public bool IsReady => ready;
     public int ParticleCapacity => particleCapacity;
@@ -117,6 +149,17 @@ public class SPHCompute : MonoBehaviour
     public float LastMaxAccel { get; private set; }
 
     public bool HasPendingExtremesReadback => extremesPending;
+
+    /// <summary>Grid geometry for the current step. Valid after DispatchCellKeys.</summary>
+    public int GridCols { get; private set; }
+    public int GridRows { get; private set; }
+    public float CellSize { get; private set; }
+    public float2 GridOrigin { get; private set; }
+
+    /// <summary>Number of distinct buckets the current key mode can produce.</summary>
+    public int BucketCount => keyMode == CellKeyMode.SpatialHash
+        ? hashTableSize
+        : GridCols * GridRows;
 
     private ComputeBuffer ParticlesIn => particleBuffers[current];
     private ComputeBuffer ParticlesOut => particleBuffers[1 - current];
@@ -157,6 +200,7 @@ public class SPHCompute : MonoBehaviour
                      ProbeKernelName, DensityKernelName, PressureKernelName,
                      ForceKernelName, ViscosityKernelName, IntegrateKernelName,
                      ClearExtremesKernelName, ReduceExtremesKernelName,
+                     CellKeysKernelName,
                  })
         {
             if (!shader.HasKernel(name))
@@ -178,6 +222,7 @@ public class SPHCompute : MonoBehaviour
         integrateKernel = shader.FindKernel(IntegrateKernelName);
         clearExtremesKernel = shader.FindKernel(ClearExtremesKernelName);
         reduceExtremesKernel = shader.FindKernel(ReduceExtremesKernelName);
+        cellKeysKernel = shader.FindKernel(CellKeysKernelName);
 
         particleBuffers[0] = new ComputeBuffer(particleCapacity, ParticleStride, ComputeBufferType.Structured);
         particleBuffers[1] = new ComputeBuffer(particleCapacity, ParticleStride, ComputeBufferType.Structured);
@@ -191,6 +236,11 @@ public class SPHCompute : MonoBehaviour
         viscosityForce = new ComputeBuffer(particleCapacity, sizeof(float) * 2, ComputeBufferType.Structured);
 
         extremes = new ComputeBuffer(2, sizeof(uint), ComputeBufferType.Structured);
+
+        cellKeys = new ComputeBuffer(particleCapacity, sizeof(uint), ComputeBufferType.Structured);
+        cellCoords = new ComputeBuffer(particleCapacity, sizeof(int) * 2, ComputeBufferType.Structured);
+
+        if (hashTableSize <= 0) hashTableSize = 2 * particleCapacity + 1;
 
         // Park a one-element boundary buffer immediately. The kernel reads element
         // zero unconditionally, so it must never be null, and a zero-length
@@ -392,6 +442,53 @@ public class SPHCompute : MonoBehaviour
         shader.SetVector("_Gravity", new Vector4(parameters.gravity.x, parameters.gravity.y, 0f, 0f));
 
         shader.Dispatch(reduceExtremesKernel, GroupCount(), 1, 1);
+    }
+
+    /// <summary>
+    /// Maps every particle to a cell coordinate and then to a bucket key. This is
+    /// the input the T-031 count sort consumes.
+    /// </summary>
+    public void DispatchCellKeys()
+    {
+        if (!ready || !hasParameters) return;
+
+        ComputeGridGeometry();
+
+        shader.SetInt("_ParticleCount", particleCapacity);
+        shader.SetFloat("_CellSize", CellSize);
+        shader.SetVector("_GridOrigin", new Vector4(GridOrigin.x, GridOrigin.y, 0f, 0f));
+        shader.SetInt("_GridCols", GridCols);
+        shader.SetInt("_GridRows", GridRows);
+        shader.SetInt("_HashTableSize", hashTableSize);
+        shader.SetInt("_KeyMode", (int)keyMode);
+
+        shader.SetBuffer(cellKeysKernel, "_ParticlesIn", ParticlesIn);
+        shader.SetBuffer(cellKeysKernel, "_CellKeys", cellKeys);
+        shader.SetBuffer(cellKeysKernel, "_CellCoords", cellCoords);
+        shader.Dispatch(cellKeysKernel, GroupCount(), 1, 1);
+    }
+
+    /// <summary>
+    /// Derives the grid geometry from the solver parameters.
+    /// </summary>
+    /// <remarks>
+    /// The domain is the container plus one smoothing length of margin on every
+    /// side, mirroring SPH2D.RebuildNeighbors, so that boundary particles sit
+    /// inside the grid rather than being clamped into its edge cells. Cell size is
+    /// exactly h, for the same reason as the CPU grid: the 3x3 query is only
+    /// guaranteed complete when cell size is >= h.
+    /// </remarks>
+    private void ComputeGridGeometry()
+    {
+        CellSize = math.max(0.0001f, parameters.smoothingLength);
+
+        float margin = parameters.smoothingLength * 1.01f;
+        float2 half = parameters.boxHalfSize + new float2(margin, margin);
+        float2 size = half * 2f;
+
+        GridOrigin = parameters.boxCenter - half;
+        GridCols = math.max(1, (int)math.ceil(size.x / CellSize));
+        GridRows = math.max(1, (int)math.ceil(size.y / CellSize));
     }
 
     /// <summary>
@@ -622,6 +719,31 @@ public class SPHCompute : MonoBehaviour
         NativeArray<float2>.Copy(vectorScratch, into, particleCapacity);
     }
 
+    /// <summary>
+    /// Reads back the per-particle cell keys and cell coordinates. Both
+    /// destinations must hold the whole buffer.
+    /// </summary>
+    public void ReadbackCellKeys(NativeArray<uint> outKeys, NativeArray<int2> outCoords)
+    {
+        if (!ready) return;
+
+        if (outKeys.Length < particleCapacity || outCoords.Length < particleCapacity)
+        {
+            Debug.LogError($"SPHCompute.ReadbackCellKeys: destinations hold " +
+                           $"{outKeys.Length}/{outCoords.Length} slots but the buffer holds {particleCapacity}.");
+            return;
+        }
+
+        if (keyScratch == null || keyScratch.Length != particleCapacity) keyScratch = new uint[particleCapacity];
+        if (coordScratch == null || coordScratch.Length != particleCapacity) coordScratch = new int2[particleCapacity];
+
+        cellKeys.GetData(keyScratch, 0, 0, particleCapacity);
+        cellCoords.GetData(coordScratch, 0, 0, particleCapacity);
+
+        NativeArray<uint>.Copy(keyScratch, outKeys, particleCapacity);
+        NativeArray<int2>.Copy(coordScratch, outCoords, particleCapacity);
+    }
+
     // ------------------------------------------------------------------
     // Self test (T-026)
     // ------------------------------------------------------------------
@@ -740,6 +862,8 @@ public class SPHCompute : MonoBehaviour
         force?.Release();
         viscosityForce?.Release();
         extremes?.Release();
+        cellKeys?.Release();
+        cellCoords?.Release();
 
         boundary = null;
         density = null;
@@ -749,6 +873,8 @@ public class SPHCompute : MonoBehaviour
         force = null;
         viscosityForce = null;
         extremes = null;
+        cellKeys = null;
+        cellCoords = null;
 
         boundaryCapacity = 0;
         BoundaryCount = 0;
@@ -762,11 +888,14 @@ public class SPHCompute : MonoBehaviour
         integrateKernel = -1;
         clearExtremesKernel = -1;
         reduceExtremesKernel = -1;
+        cellKeysKernel = -1;
 
         readbackScratch = null;
         scalarScratch = null;
         vectorScratch = null;
         extremesScratch = null;
+        keyScratch = null;
+        coordScratch = null;
 
         extremesPending = false;
         hasParameters = false;

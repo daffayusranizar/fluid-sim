@@ -25,6 +25,7 @@
 #pragma kernel Integrate
 #pragma kernel ClearExtremes
 #pragma kernel ReduceExtremes
+#pragma kernel ComputeCellKeys
 
 struct Particle
 {
@@ -69,6 +70,27 @@ RWStructuredBuffer<float2> _ViscosityForce;
 // still needs to size an adaptive time step, and it is the reason T-029 does not
 // become a fixed-step solver by accident.
 RWStructuredBuffer<uint> _Extremes;
+
+// ----------------------------------------------------------------------
+// Spatial partitioning keys (T-030)
+// ----------------------------------------------------------------------
+
+// One key per particle. This is the whole of T-030: map a position to a cell,
+// then map that cell to a bucket. The count sort that consumes these keys is
+// T-031.
+RWStructuredBuffer<uint> _CellKeys;
+RWStructuredBuffer<int2> _CellCoords;
+
+// 0 = direct cell index, 1 = prime-multiplier hash. See KeyForCell for why this
+// build defaults to the direct index even though the hash is the portable form.
+uint _KeyMode;
+
+uint _GridCols;
+uint _GridRows;
+uint _HashTableSize;
+
+float _CellSize;
+float2 _GridOrigin;
 
 uint _ParticleCount;
 uint _BoundaryCount;
@@ -467,4 +489,62 @@ void ReduceExtremes(uint3 id : SV_DispatchThreadID)
         float2 a = _Force[i] / d + _Gravity;
         InterlockedMax(_Extremes[1], asuint(length(a)));
     }
+}
+
+// ----------------------------------------------------------------------
+// Spatial keys (T-030)
+// ----------------------------------------------------------------------
+
+/// Cell coordinate of a position. The grid origin is included in the domain, so
+/// for this bounded box the result is always inside [0, cols) x [0, rows).
+int2 CellCoordOf(float2 position)
+{
+    return (int2)floor((position - _GridOrigin) / _CellSize);
+}
+
+/// Maps a cell to a bucket.
+///
+/// Two modes, because the right answer depends on whether the domain is bounded:
+///
+/// - Direct index (mode 0): unique per cell, so collisions are impossible. Only
+///   valid for a bounded domain where the cell is known to be inside the grid,
+///   which is exactly this box.
+///
+/// - Prime-multiplier hash (mode 1): the portable form, for an unbounded domain
+///   where cell coordinates are arbitrary. XOR rather than add so the two axes do
+///   not carry into each other, and primes so that a regular lattice -- which is
+///   precisely what a spawn grid produces -- does not collapse into a few buckets.
+///
+/// It is tempting to assume the bigger hash table (2N vs ~N/4.5 buckets) buys
+/// fewer candidates per query. It does not. With cell size = h a cell holds
+/// ~h^2/spacing^2 ~ 4.8 particles either way, so a 3x3 query scans the same ~43
+/// candidates in both modes; the hash only adds false positives and memory.
+/// The hash earns its place when the domain is unbounded.
+uint KeyForCell(int2 cell)
+{
+    if (_KeyMode == 1u)
+    {
+        uint x = (uint)cell.x * 73856093u;
+        uint y = (uint)cell.y * 19349663u;
+        return (x ^ y) % _HashTableSize;
+    }
+
+    int cx = clamp(cell.x, 0, (int)_GridCols - 1);
+    int cy = clamp(cell.y, 0, (int)_GridRows - 1);
+    return (uint)(cy * (int)_GridCols + cx);
+}
+
+/// One key and one cell coordinate per particle. The coordinate is kept as well
+/// as the key because a hashed bucket cannot be inverted: a neighbour query has
+/// to reject candidates whose cell is not actually adjacent.
+[numthreads(64, 1, 1)]
+void ComputeCellKeys(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount) return;
+
+    int2 cell = CellCoordOf(_ParticlesIn[i].position);
+
+    _CellCoords[i] = cell;
+    _CellKeys[i] = KeyForCell(cell);
 }
