@@ -55,7 +55,9 @@ public class ParticleRenderer2D : MonoBehaviour
     [Header("Particle Appearance")]
     [Tooltip("World-space radius of one particle disc. Ignored when " +
              "autoParticleRadius is on.")]
-    public float particleRadius = 0.12f;
+    // Manual fallback only. 0.055 is 0.8 x the spacing at 5000 particles, so
+    // switching autoParticleRadius off does not change the look.
+    public float particleRadius = 0.055f;
 
     [Tooltip("Size impostors from the particle spacing instead of a fixed radius. " +
              "Without this the same number means 'separate dots' at 400 particles " +
@@ -72,7 +74,9 @@ public class ParticleRenderer2D : MonoBehaviour
     [Tooltip("Speed mapped to the top of the colour gradient. Particles at or " +
              "above this render as the gradient's final colour. Ignored when " +
              "autoVelocityMax is on.")]
-    public float velocityDisplayMax = 6f;
+    // Manual fallback only. The fluid runs at 7-38, so the old 6 pinned nearly
+    // everything to the top of the ramp.
+    public float velocityDisplayMax = 20f;
 
     [Tooltip("Derive the top of the colour ramp from the simulation's own peak " +
              "speed instead of a fixed number. The peak is already reduced every " +

@@ -75,8 +75,10 @@ public class SPHCompute : MonoBehaviour
     [Tooltip("Particle capacity. Buffers are allocated to this by Initialize().")]
     public int particleCapacity = 5000;
 
-    [Tooltip("Scalar the solver uses to weight boundary contributions (spawnSpacing squared).")]
-    public float boundaryVolume = 0.0625f;
+    [Tooltip("Only used by the round-trip probe. The simulation takes the real " +
+             "value from SolverParams, which is spawnSpacing squared (0.0048 at " +
+             "5000 particles).")]
+    public float boundaryVolume = 0.0048f;
 
     [Tooltip("Run the round-trip self test once in Start(). Turn this off once " +
              "SPHComputeSimulation is driving the pipeline.")]

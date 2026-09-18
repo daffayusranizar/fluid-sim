@@ -47,8 +47,9 @@ public class SPHComputeSimulation : MonoBehaviour
     [Tooltip("Read back once every N frames when showGizmos is on.")]
     public int gizmoReadbackInterval = 15;
 
-    [Tooltip("Gizmo sphere radius, world units.")]
-    public float gizmoRadius = 0.08f;
+    [Tooltip("Gizmo sphere radius, world units. Sized to roughly half the particle " +
+             "spacing at 5000 particles (0.069), so the spheres stay distinct.")]
+    public float gizmoRadius = 0.03f;
 
     private float accumulator;
     private int frameCounter;

@@ -13,7 +13,7 @@ using UnityEngine;
 public class SPH2D : MonoBehaviour
 {
     [Header("Container")]
-    public Vector2 boxSize = new Vector2(20f, 20f);
+    public Vector2 boxSize = new Vector2(10f, 10f);
 
     [Header("Particles")]
     [Tooltip("Total number of particles. Spawning is a blue-noise scatter, so " +
@@ -82,7 +82,11 @@ public class SPH2D : MonoBehaviour
 
     [Header("Debug Visualization")]
     public bool debugLogs = false;
-    public bool showForceArrows = true;
+
+    // Off by default. At 5000 particles these draw 5000 spheres and 5000 arrows in
+    // the Scene view every repaint, which is slower than the simulation itself and
+    // unreadable anyway. ParticleRenderer2D draws the fluid.
+    public bool showForceArrows = false;
     public bool showViscosityArrows = false;
     public float forceArrowLength = 0.4f;
 
@@ -90,7 +94,7 @@ public class SPH2D : MonoBehaviour
              "fallback visualiser and stays on by default: turn it off once " +
              "ParticleRenderer2D's instanced discs are confirmed working, since " +
              "drawing both doubles the work.")]
-    public bool showParticleGizmos = true;
+    public bool showParticleGizmos = false;
 
     // --- Native simulation state ---
     // Structure of arrays, so each pass writes one array and reads others with no
@@ -695,14 +699,20 @@ public class SPH2D : MonoBehaviour
     {
         if (!renderBuffer.IsCreated) return;
 
-        RefreshRenderSnapshot();
-
-        // 1. Draw container
+        // 1. Draw container. Cheap, and the only thing worth drawing by default.
         Gizmos.color = Color.blue;
         Gizmos.DrawWireCube(transform.position, new Vector3(boxSize.x, boxSize.y, 0f));
 
+        // Everything below needs the managed snapshot, which is a 5000-element copy
+        // per repaint. At 400 particles that was free; at 5000 it is not, and the
+        // boundary overlay alone is over a thousand spheres.
+        bool needsSnapshot = showParticleGizmos || showForceArrows || showViscosityArrows;
+        if (!needsSnapshot) return;
+
+        RefreshRenderSnapshot();
+
         // 1a. Boundary particles (static solid material just outside the walls)
-        if (renderBoundary != null && useBoundaryParticles)
+        if (showParticleGizmos && renderBoundary != null && useBoundaryParticles)
         {
             Gizmos.color = new Color(0.4f, 0.4f, 0.4f, 1f);
 
