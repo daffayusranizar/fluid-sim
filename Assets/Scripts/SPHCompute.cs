@@ -156,6 +156,12 @@ public class SPHCompute : MonoBehaviour
 
     public bool IsReady => ready;
     public int ParticleCapacity => particleCapacity;
+
+    /// <summary>
+    /// The buffer holding the current particle state. Exposed so the renderer can
+    /// bind it directly instead of reading state back to the CPU.
+    /// </summary>
+    public ComputeBuffer ParticleBuffer => ready ? ParticlesIn : null;
     public int BoundaryCount { get; private set; }
 
     /// <summary>

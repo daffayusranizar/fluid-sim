@@ -32,6 +32,13 @@ public class ParticleRenderer2D : MonoBehaviour
         Monochrome,
     }
 
+    [Header("Source")]
+    [Tooltip("Optional GPU solver. When set, the renderer binds the solver's own " +
+             "particle buffer instead of packing and uploading CPU state, so a GPU " +
+             "simulation renders with no per-frame readback and no upload. Leave " +
+             "empty to render the Burst CPU solver instead.")]
+    public SPHCompute gpuSource;
+
     [Header("Particle Appearance")]
     [Tooltip("World-space radius of one particle disc.")]
     public float particleRadius = 0.12f;
@@ -49,14 +56,23 @@ public class ParticleRenderer2D : MonoBehaviour
     [Tooltip("Width of the gradient texture. Higher gives a smoother ramp.")]
     public int gradientResolution = 128;
 
+    /// <summary>Bytes per particle. Must match the shader's Particle struct.</summary>
+    private const int ParticleStride = sizeof(float) * 10;
+
     private Material material;
     private Mesh quad;
     private ComputeBuffer argsBuffer;
-    private ComputeBuffer particleBuffer;
+
+    // Only used on the CPU path. On the GPU path the solver's buffer is bound
+    // directly, so nothing is allocated or uploaded here.
+    private ComputeBuffer ownParticleBuffer;
+
+    private ComputeBuffer boundBuffer;
+    private int boundCount;
+
     private Texture2D gradientTexture;
 
     private SPH2D sim;
-    private int particleCapacity;
     private bool needsSettingsUpdate = true;
 
     /// <summary>Fallback used when preset is Custom and the gradient is empty.</summary>
@@ -132,6 +148,9 @@ public class ParticleRenderer2D : MonoBehaviour
         // renderer, so SPH2D stays pure simulation and knows nothing about drawing.
         sim = GetComponent<SPH2D>();
 
+        // Auto-wire the GPU source when both live on the same object.
+        if (gpuSource == null) gpuSource = GetComponent<SPHCompute>();
+
         Shader shader = Shader.Find("FluidSim/Particle2D");
 
         if (shader == null)
@@ -149,7 +168,7 @@ public class ParticleRenderer2D : MonoBehaviour
     private void OnDestroy()
     {
         ReleaseBuffer(ref argsBuffer);
-        ReleaseBuffer(ref particleBuffer);
+        ReleaseBuffer(ref ownParticleBuffer);
 
         if (material != null)
         {
@@ -178,14 +197,60 @@ public class ParticleRenderer2D : MonoBehaviour
 
     private void LateUpdate()
     {
-        if (material == null || sim == null) return;
+        if (material == null) return;
+
+        // GPU path: bind the solver's own buffer. Nothing is copied, nothing is
+        // uploaded, and the instance count is the solver's capacity.
+        if (gpuSource != null && gpuSource.IsReady)
+        {
+            Render(gpuSource.ParticleBuffer, gpuSource.ParticleCapacity);
+            return;
+        }
+
+        // CPU path: pack from SPH2D and upload. Still supported so the two solvers
+        // can be compared side by side.
+        if (sim == null) return;
 
         NativeArray<Particle2D> particles = sim.Particles;
 
         if (!particles.IsCreated || particles.Length == 0) return;
 
-        EnsureBufferCapacity(particles.Length);
-        particleBuffer.SetData(particles);
+        int count = particles.Length;
+
+        if (ownParticleBuffer == null || ownParticleBuffer.count != count)
+        {
+            ReleaseBuffer(ref ownParticleBuffer);
+            ownParticleBuffer = new ComputeBuffer(count, ParticleStride);
+            boundBuffer = null;
+        }
+
+        ownParticleBuffer.SetData(particles);
+        Render(ownParticleBuffer, count);
+    }
+
+    /// <summary>
+    /// Binds <paramref name="buffer"/> and issues one instanced draw.
+    /// </summary>
+    /// <remarks>
+    /// The material buffer and the args buffer are only rebuilt when the source or
+    /// the count changes, so a steady frame is a single draw call with no buffer
+    /// traffic. The instance count lives inside the args buffer, which is why it
+    /// has to be tracked alongside the binding rather than queried back.
+    /// </remarks>
+    private void Render(ComputeBuffer buffer, int count)
+    {
+        if (buffer == null || count <= 0) return;
+
+        if (boundBuffer != buffer || boundCount != count)
+        {
+            material.SetBuffer("Particles", buffer);
+
+            ReleaseBuffer(ref argsBuffer);
+            argsBuffer = CreateArgsBuffer(quad, count);
+
+            boundBuffer = buffer;
+            boundCount = count;
+        }
 
         if (needsSettingsUpdate)
         {
@@ -197,24 +262,6 @@ public class ParticleRenderer2D : MonoBehaviour
         // the buffer, so Unity has no way to cull it correctly from the mesh alone.
         var bounds = new Bounds(Vector3.zero, Vector3.one * 10000f);
         Graphics.DrawMeshInstancedIndirect(quad, 0, material, bounds, argsBuffer);
-    }
-
-    private void EnsureBufferCapacity(int count)
-    {
-        if (particleBuffer != null && particleCapacity == count) return;
-
-        ReleaseBuffer(ref particleBuffer);
-
-        // 40 bytes matches the Particle2D layout the shader declares
-        const int stride = sizeof(float) * 10;
-
-        particleBuffer = new ComputeBuffer(count, stride);
-        particleCapacity = count;
-
-        material.SetBuffer("Particles", particleBuffer);
-
-        ReleaseBuffer(ref argsBuffer);
-        argsBuffer = CreateArgsBuffer(quad, count);
     }
 
     private void UpdateSettings()
